@@ -112,7 +112,7 @@ bool LatticePlanner::initialize() {
     
     // Initialize subscribers
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/pf/pose/odom", 10, 
+        "/odom", 10, 
         std::bind(&LatticePlanner::odom_callback, this, std::placeholders::_1));
     
     laser_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
