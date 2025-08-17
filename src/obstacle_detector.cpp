@@ -1,61 +1,90 @@
 #include "lattice_planner_pkg/obstacle_detector.hpp"
 #include <cmath>
 #include <limits>
+#include <algorithm>
+#include <numeric>
 
 namespace lattice_planner_pkg {
 namespace advanced {
 
-ObstacleDetector::ObstacleDetector(const ObstacleDetectionConfig& config) : config_(config) {}
+ObstacleDetector::ObstacleDetector(const ObstacleDetectionConfig& config) 
+    : config_(config), next_track_id_(1) {}
 
 void ObstacleDetector::detectObstaclesFromScan(
     const sensor_msgs::msg::LaserScan::SharedPtr scan,
     double ego_x, double ego_y, double ego_yaw,
     const rclcpp::Clock::SharedPtr& clock) {
     
-    detected_obstacles_.clear();
+    std::lock_guard<std::mutex> lock(obstacles_mutex_);
     
-    for (size_t i = 0; i < scan->ranges.size(); ++i) {
-        double range = scan->ranges[i];
+    // 1단계: 라이다 데이터 전처리
+    std::vector<double> filtered_ranges = preprocessLidarData(scan);
+    
+    // 2단계: 유효한 포인트들을 수집하고 글로벌 좌표로 변환
+    std::vector<std::pair<double, double>> valid_points;
+    
+    for (size_t i = 0; i < filtered_ranges.size(); ++i) {
+        double range = filtered_ranges[i];
         
-        if (range < scan->range_min || range > scan->range_max || 
-            range > config_.max_detection_range) {
+        if (range < config_.min_range_threshold || 
+            range > config_.max_range_threshold ||
+            range > config_.max_detection_range ||
+            std::isnan(range) || std::isinf(range)) {
             continue;
         }
         
         double angle = scan->angle_min + i * scan->angle_increment;
         
-        // 전방 ±90도 범위만 고려 (후방 장애물 무시)
+        // 시야각 필터링
         if (std::abs(angle) > config_.lateral_range) {
             continue;
         }
         
-        double obstacle_x = ego_x + range * std::cos(ego_yaw + angle);
-        double obstacle_y = ego_y + range * std::sin(ego_yaw + angle);
+        // 차량 진행 방향 기준 필터링
+        double forward_distance = range * std::cos(angle);
+        double lateral_distance = std::abs(range * std::sin(angle));
         
-        // 차량 진행 방향 기준 필터링 추가
-        double forward_distance = range * std::cos(angle);  // 전방 거리
-        double lateral_distance = std::abs(range * std::sin(angle));  // 좌우 거리
-        
-        // 전방 6m 이내, 좌우 3m 이내만 장애물로 인식
-        if (forward_distance < 0.0 || forward_distance > config_.forward_distance_max || 
+        if (forward_distance < 0.0 || 
+            forward_distance > config_.forward_distance_max || 
             lateral_distance > config_.lateral_distance_max) {
             continue;
         }
         
-        AdvancedObstacle obs;
-        obs.x = obstacle_x;
-        obs.y = obstacle_y;
-        obs.distance = range;
-        obs.angle = angle;
-        obs.timestamp = clock->now();
+        // 글로벌 좌표로 변환
+        double global_x = ego_x + range * std::cos(ego_yaw + angle);
+        double global_y = ego_y + range * std::sin(ego_yaw + angle);
         
-        detected_obstacles_.push_back(obs);
+        valid_points.emplace_back(global_x, global_y);
     }
+    
+    // 3단계: 클러스터링을 통한 장애물 감지
+    std::vector<AdvancedObstacle> new_obstacles = clusterLidarPoints(valid_points, clock);
+    
+    // 4단계: 추적 시스템 업데이트
+    updateTracking(new_obstacles, clock);
+    
+    // 5단계: 속도 추정
+    estimateVelocities();
+    
+    // 현재 감지된 장애물 업데이트
+    detected_obstacles_.clear();
+    for (const auto& track : tracked_obstacles_) {
+        if (track.is_confirmed && track.lost_frames < config_.max_lost_frames) {
+            detected_obstacles_.push_back(track.current_state);
+        }
+    }
+    
+    last_scan_time_ = clock->now();
 }
 
 void ObstacleDetector::updateOccupancyGrid(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
     std::lock_guard<std::mutex> lk(grid_mutex_);
     latest_grid_ = msg;
+}
+
+bool ObstacleDetector::hasOccupancyGrid() const {
+    std::lock_guard<std::mutex> lk(grid_mutex_);
+    return latest_grid_ != nullptr;
 }
 
 bool ObstacleDetector::hasLidarObstacles() const {
@@ -271,6 +300,307 @@ double ObstacleDetector::calculateProximityCost(int mx, int my, const nav_msgs::
         return (1.0 - distance_ratio) * 6.0; // 최대 6.0점, 가까울수록 높은 비용
     }
     return 0.0;
+}
+
+// 새로운 라이다 전처리 함수들 구현
+std::vector<double> ObstacleDetector::preprocessLidarData(const sensor_msgs::msg::LaserScan::SharedPtr scan) {
+    std::vector<double> ranges(scan->ranges.begin(), scan->ranges.end());
+    
+    // 1단계: 중앙값 필터링 (노이즈 제거)
+    ranges = medianFilter(ranges, config_.median_filter_size);
+    
+    // 2단계: 이상치 제거
+    ranges = removeOutliers(ranges, *scan);
+    
+    return ranges;
+}
+
+std::vector<double> ObstacleDetector::medianFilter(const std::vector<double>& ranges, int window_size) {
+    if (window_size <= 1) return ranges;
+    
+    std::vector<double> filtered = ranges;
+    int half_window = window_size / 2;
+    
+    for (size_t i = half_window; i < ranges.size() - half_window; ++i) {
+        std::vector<double> window;
+        for (int j = -half_window; j <= half_window; ++j) {
+            double val = ranges[i + j];
+            if (!std::isnan(val) && !std::isinf(val)) {
+                window.push_back(val);
+            }
+        }
+        
+        if (!window.empty()) {
+            std::sort(window.begin(), window.end());
+            filtered[i] = window[window.size() / 2];
+        }
+    }
+    
+    return filtered;
+}
+
+std::vector<double> ObstacleDetector::removeOutliers(const std::vector<double>& ranges, 
+                                                    const sensor_msgs::msg::LaserScan& scan) {
+    std::vector<double> cleaned = ranges;
+    
+    for (size_t i = 1; i < ranges.size() - 1; ++i) {
+        if (std::isnan(ranges[i]) || std::isinf(ranges[i])) continue;
+        
+        double prev = ranges[i-1];
+        double curr = ranges[i];
+        double next = ranges[i+1];
+        
+        // 이웃 포인트들과의 거리 차이가 임계값보다 크면 이상치로 판단
+        bool is_outlier = false;
+        if (!std::isnan(prev) && !std::isinf(prev)) {
+            if (std::abs(curr - prev) > config_.outlier_threshold) {
+                is_outlier = true;
+            }
+        }
+        if (!std::isnan(next) && !std::isinf(next)) {
+            if (std::abs(curr - next) > config_.outlier_threshold) {
+                is_outlier = true;
+            }
+        }
+        
+        if (is_outlier) {
+            cleaned[i] = std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+    
+    return cleaned;
+}
+
+std::vector<AdvancedObstacle> ObstacleDetector::clusterLidarPoints(
+    const std::vector<std::pair<double, double>>& points,
+    const rclcpp::Clock::SharedPtr& clock) {
+    
+    std::vector<AdvancedObstacle> obstacles;
+    if (points.empty()) return obstacles;
+    
+    std::vector<bool> clustered(points.size(), false);
+    
+    for (size_t i = 0; i < points.size(); ++i) {
+        if (clustered[i]) continue;
+        
+        // 새로운 클러스터 시작
+        std::vector<std::pair<double, double>> cluster;
+        std::vector<size_t> to_check = {i};
+        clustered[i] = true;
+        
+        while (!to_check.empty()) {
+            size_t current_idx = to_check.back();
+            to_check.pop_back();
+            cluster.push_back(points[current_idx]);
+            
+            // 근처 포인트들 찾기
+            for (size_t j = 0; j < points.size(); ++j) {
+                if (clustered[j]) continue;
+                
+                double dx = points[current_idx].first - points[j].first;
+                double dy = points[current_idx].second - points[j].second;
+                double distance = std::sqrt(dx*dx + dy*dy);
+                
+                if (distance < config_.cluster_distance_threshold) {
+                    clustered[j] = true;
+                    to_check.push_back(j);
+                }
+            }
+        }
+        
+        // 클러스터 검증 및 장애물 생성
+        if (isValidCluster(cluster)) {
+            AdvancedObstacle obstacle;
+            
+            // 클러스터 중심 계산
+            double sum_x = 0, sum_y = 0;
+            for (const auto& point : cluster) {
+                sum_x += point.first;
+                sum_y += point.second;
+            }
+            obstacle.x = sum_x / cluster.size();
+            obstacle.y = sum_y / cluster.size();
+            
+            // 거리 및 각도 계산
+            obstacle.distance = std::sqrt(obstacle.x*obstacle.x + obstacle.y*obstacle.y);
+            obstacle.angle = std::atan2(obstacle.y, obstacle.x);
+            
+            // 크기 계산
+            obstacle.size = calculateObstacleSize(cluster);
+            
+            // 기타 속성 초기화
+            obstacle.velocity_x = 0.0;
+            obstacle.velocity_y = 0.0;
+            obstacle.intensity = 0;
+            obstacle.is_dynamic = false;
+            obstacle.track_id = -1;
+            obstacle.timestamp = clock->now();
+            obstacle.cluster_points = cluster;
+            
+            obstacles.push_back(obstacle);
+        }
+    }
+    
+    return obstacles;
+}
+
+void ObstacleDetector::updateTracking(const std::vector<AdvancedObstacle>& new_obstacles,
+                                     const rclcpp::Clock::SharedPtr& clock) {
+    
+    // 기존 트랙들의 lost_frames 증가
+    for (auto& track : tracked_obstacles_) {
+        track.lost_frames++;
+    }
+    
+    // 새로운 장애물과 기존 트랙 매칭
+    std::vector<bool> obstacle_matched(new_obstacles.size(), false);
+    
+    for (auto& track : tracked_obstacles_) {
+        double min_distance = std::numeric_limits<double>::max();
+        int best_match = -1;
+        
+        for (size_t i = 0; i < new_obstacles.size(); ++i) {
+            if (obstacle_matched[i]) continue;
+            
+            double distance = distanceBetween(track.current_state, new_obstacles[i]);
+            if (distance < config_.tracking_distance_threshold && distance < min_distance) {
+                min_distance = distance;
+                best_match = i;
+            }
+        }
+        
+        if (best_match >= 0) {
+            // 매칭된 경우 트랙 업데이트
+            obstacle_matched[best_match] = true;
+            track.history.push_back(track.current_state);
+            track.current_state = new_obstacles[best_match];
+            track.current_state.track_id = track.track_id;
+            track.lost_frames = 0;
+            track.is_confirmed = true;
+            
+            // 히스토리 크기 제한
+            if (track.history.size() > 10) {
+                track.history.erase(track.history.begin());
+            }
+        }
+    }
+    
+    // 매칭되지 않은 새로운 장애물들을 새 트랙으로 추가
+    for (size_t i = 0; i < new_obstacles.size(); ++i) {
+        if (!obstacle_matched[i]) {
+            ObstacleTrack new_track;
+            new_track.track_id = next_track_id_++;
+            new_track.current_state = new_obstacles[i];
+            new_track.current_state.track_id = new_track.track_id;
+            new_track.lost_frames = 0;
+            new_track.is_confirmed = false;  // 여러 프레임에서 확인되어야 함
+            
+            tracked_obstacles_.push_back(new_track);
+        }
+    }
+    
+    // 오래된 트랙들 제거
+    tracked_obstacles_.erase(
+        std::remove_if(tracked_obstacles_.begin(), tracked_obstacles_.end(),
+            [this](const ObstacleTrack& track) {
+                return track.lost_frames > config_.max_lost_frames;
+            }),
+        tracked_obstacles_.end()
+    );
+}
+
+void ObstacleDetector::estimateVelocities() {
+    for (auto& track : tracked_obstacles_) {
+        if (track.history.size() < 2) continue;
+        
+        const auto& current = track.current_state;
+        const auto& prev = track.history.back();
+        
+        double dt = (current.timestamp - prev.timestamp).seconds();
+        if (dt > 0.001 && dt < config_.velocity_estimation_window) {
+            track.current_state.velocity_x = (current.x - prev.x) / dt;
+            track.current_state.velocity_y = (current.y - prev.y) / dt;
+            
+            double speed = std::sqrt(track.current_state.velocity_x * track.current_state.velocity_x +
+                                   track.current_state.velocity_y * track.current_state.velocity_y);
+            
+            track.current_state.is_dynamic = (speed > config_.min_dynamic_velocity);
+        }
+    }
+}
+
+// 헬퍼 함수들 구현
+double ObstacleDetector::calculateObstacleSize(const std::vector<std::pair<double, double>>& points) {
+    if (points.size() < 2) return config_.min_obstacle_size;
+    
+    double min_x = points[0].first, max_x = points[0].first;
+    double min_y = points[0].second, max_y = points[0].second;
+    
+    for (const auto& point : points) {
+        min_x = std::min(min_x, point.first);
+        max_x = std::max(max_x, point.first);
+        min_y = std::min(min_y, point.second);
+        max_y = std::max(max_y, point.second);
+    }
+    
+    return std::max(max_x - min_x, max_y - min_y);
+}
+
+bool ObstacleDetector::isValidCluster(const std::vector<std::pair<double, double>>& cluster) {
+    if (cluster.size() < static_cast<size_t>(config_.min_cluster_size)) {
+        return false;
+    }
+    
+    double size = calculateObstacleSize(cluster);
+    return (size >= config_.min_obstacle_size && size <= config_.max_obstacle_size);
+}
+
+double ObstacleDetector::distanceBetween(const AdvancedObstacle& a, const AdvancedObstacle& b) {
+    double dx = a.x - b.x;
+    double dy = a.y - b.y;
+    return std::sqrt(dx*dx + dy*dy);
+}
+
+// 새로운 접근자 함수들 구현
+std::vector<AdvancedObstacle> ObstacleDetector::getTrackedObstacles() const {
+    std::lock_guard<std::mutex> lock(obstacles_mutex_);
+    std::vector<AdvancedObstacle> obstacles;
+    
+    for (const auto& track : tracked_obstacles_) {
+        if (track.is_confirmed && track.lost_frames < config_.max_lost_frames) {
+            obstacles.push_back(track.current_state);
+        }
+    }
+    
+    return obstacles;
+}
+
+std::vector<AdvancedObstacle> ObstacleDetector::getDynamicObstacles() const {
+    std::lock_guard<std::mutex> lock(obstacles_mutex_);
+    std::vector<AdvancedObstacle> dynamic_obstacles;
+    
+    for (const auto& track : tracked_obstacles_) {
+        if (track.is_confirmed && track.lost_frames < config_.max_lost_frames && 
+            track.current_state.is_dynamic) {
+            dynamic_obstacles.push_back(track.current_state);
+        }
+    }
+    
+    return dynamic_obstacles;
+}
+
+std::vector<AdvancedObstacle> ObstacleDetector::getStaticObstacles() const {
+    std::lock_guard<std::mutex> lock(obstacles_mutex_);
+    std::vector<AdvancedObstacle> static_obstacles;
+    
+    for (const auto& track : tracked_obstacles_) {
+        if (track.is_confirmed && track.lost_frames < config_.max_lost_frames && 
+            !track.current_state.is_dynamic) {
+            static_obstacles.push_back(track.current_state);
+        }
+    }
+    
+    return static_obstacles;
 }
 
 } // namespace advanced

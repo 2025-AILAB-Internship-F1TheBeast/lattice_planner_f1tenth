@@ -18,11 +18,24 @@ CandidateResult* PathSelector::selectOptimalPath(
         return nullptr;
     }
     
-    RCLCPP_INFO(rclcpp::get_logger("path_selector"), "[DEBUG] PathSelector: %zu candidates, has_obstacles=%s, current_s=%.2f", 
-               candidates.size(), has_obstacles ? "true" : "false", current_s);
+    // 실제 안전한 경로가 있는지 확인 (has_obstacles보다 정확한 판단)
+    int safe_path_count = 0;
+    int total_paths = candidates.size();
+    for (const auto& c : candidates) {
+        if (!c.collided && !c.out_of_track) {
+            safe_path_count++;
+        }
+    }
     
-    // Primary path 선택 (우선순위 기반)
-    CandidateResult* primary = selectPrimaryPath(candidates, has_obstacles);
+    bool actual_obstacle_situation = (safe_path_count == 0);  // 안전한 경로가 하나도 없으면 장애물 상황
+    
+    RCLCPP_ERROR(rclcpp::get_logger("path_selector"), 
+        "[CRITICAL] PathSelector: %d/%d safe paths, has_obstacles=%s, actual_situation=%s", 
+        safe_path_count, total_paths, has_obstacles ? "true" : "false",
+        actual_obstacle_situation ? "DANGER" : "SAFE");
+    
+    // Primary path 선택 (실제 상황 기반)
+    CandidateResult* primary = selectPrimaryPath(candidates, actual_obstacle_situation);
     CandidateResult* reference_candidate = findReferenceCandidate(candidates);
     
     // Detour 상태 업데이트
@@ -79,15 +92,63 @@ CandidateResult* PathSelector::selectOptimalPath(
                 }
             }
         } else if (commit_state_.has_commit && committed_in_set && !allow_switch) {
-            chosen = committed_in_set; // 이전 커밋 유지
+            // 이전 커밋 유지 - 단, 안전성 재확인
+            if (!(committed_in_set->collided || committed_in_set->out_of_track)) {
+                chosen = committed_in_set;
+                RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+                    "[SAFE COMMIT] Maintaining safe committed path: offset=%.3f", committed_in_set->d_offset);
+            } else {
+                // 커밋된 경로가 위험해졌으면 primary로 대체
+                chosen = primary;
+                RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
+                    "[UNSAFE COMMIT] Committed path became unsafe, switching to primary");
+            }
         } else {
-            chosen = primary; // 새 선택
+            // 새 선택 - 안전성 우선 검증
+            if (primary && !(primary->collided || primary->out_of_track)) {
+                chosen = primary;
+                RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+                    "[NEW SAFE] Selected safe primary path: offset=%.3f", primary->d_offset);
+            } else if (primary) {
+                RCLCPP_ERROR(rclcpp::get_logger("path_selector"), 
+                    "[WARNING] Primary path is unsafe but selected: offset=%.3f, collided=%s, out_of_track=%s", 
+                    primary->d_offset, primary->collided ? "true" : "false", 
+                    primary->out_of_track ? "true" : "false");
+                chosen = primary;
+            }
         }
     }
     
+    // 🚨 최종 안전 검증: 충돌 경로는 절대 반환하지 않음
     if (chosen) {
-        RCLCPP_INFO(rclcpp::get_logger("path_selector"), "[DEBUG] PathSelector chosen path: cost=%.3f, d_offset=%.3f, collided=%s", 
-                   chosen->cost, chosen->d_offset, chosen->collided ? "true" : "false");
+        if (chosen->collided || chosen->out_of_track) {
+            RCLCPP_ERROR(rclcpp::get_logger("path_selector"), 
+                "🚨🚨🚨 [SAFETY OVERRIDE] REJECTING DANGEROUS PATH: offset=%.3f, collided=%s, out_of_track=%s", 
+                chosen->d_offset, chosen->collided ? "true" : "false", chosen->out_of_track ? "true" : "false");
+            
+            // 안전한 대안 찾기
+            CandidateResult* safe_alternative = nullptr;
+            for (auto& c : candidates) {
+                if (!c.collided && !c.out_of_track) {
+                    safe_alternative = &c;
+                    break;  // 첫 번째 안전한 경로 선택
+                }
+            }
+            
+            if (safe_alternative) {
+                RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
+                    "🛡️ [SAFETY RECOVERY] Using safe alternative: offset=%.3f", safe_alternative->d_offset);
+                chosen = safe_alternative;
+            } else {
+                RCLCPP_FATAL(rclcpp::get_logger("path_selector"), 
+                    "💀 [CRITICAL] NO SAFE PATHS AVAILABLE - EMERGENCY STOP RECOMMENDED");
+                return nullptr;  // 안전한 경로가 없으면 null 반환
+            }
+        }
+        
+        RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+            "✅ [FINAL CHOICE] Safe path selected: cost=%.3f, offset=%.3f", 
+            chosen->cost, chosen->d_offset);
     } else {
         RCLCPP_WARN(rclcpp::get_logger("path_selector"), "[DEBUG] PathSelector could not choose any path");
     }
@@ -102,6 +163,9 @@ void PathSelector::updateCommitState(
     
     if (!chosen_path) return;
     
+    // 현재 장애물 상황 확인 (detour 활성화 여부로 판단)
+    bool has_current_obstacles = detour_state_.detour_active;
+    
     // 선택된 경로가 커밋과 다르면 커밋 갱신
     if (!commit_state_.has_commit || 
         std::abs(chosen_path->d_offset - commit_state_.committed_offset) > 1e-3) {
@@ -113,9 +177,21 @@ void PathSelector::updateCommitState(
         commit_state_.commit_start_time = clock->now();
         commit_state_.committed_cost = chosen_path->cost;
         commit_state_.committed_ref_alignment = chosen_path->ref_alignment;
+        commit_state_.committed_during_obstacle = has_current_obstacles;
         
-        // 경로 길이 기반 커밋: 현재 위치에서 path_length만큼 앞의 끝 지점 계산
-        commit_state_.committed_path_end_s = current_s + config_.path_length;
+        // 경로 길이 계산: 장애물 상황에서는 더 긴 커밋
+        double base_length = config_.path_length;
+        if (has_current_obstacles) {
+            commit_state_.obstacle_commit_extra_distance = base_length * (config_.obstacle_path_length_multiplier - 1.0);
+            base_length *= config_.obstacle_path_length_multiplier;
+            RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
+                "[OBSTACLE COMMIT] Extended commit length: %.2fm (extra: %.2fm)", 
+                base_length, commit_state_.obstacle_commit_extra_distance);
+        } else {
+            commit_state_.obstacle_commit_extra_distance = 0.0;
+        }
+        
+        commit_state_.committed_path_end_s = current_s + base_length;
     }
 }
 
@@ -144,33 +220,63 @@ CandidateResult* PathSelector::selectPrimaryPath(std::vector<CandidateResult>& c
         return safe_raceline;
     }
     
-    // Priority 2: Force raceline even with collision (prevent cutting inside)
-    if (raceline_candidate && has_obstacles) {
-        RCLCPP_WARN(rclcpp::get_logger("path_selector"), "[RACELINE RECOVERY] Forcing collision raceline to prevent cutting inside, cost=%.3f", raceline_candidate->cost);
-        return raceline_candidate;
-    }
+    // Priority 2: REMOVED - 위험한 충돌 raceline 강제 선택 로직 제거
+    // 안전성을 최우선으로 하여 충돌하는 raceline은 절대 선택하지 않음
     
     if (has_obstacles) {
-        // 장애물 있을 때: 충돌하지 않는 경로 중 최소 cost
-        double best_cost = std::numeric_limits<double>::infinity();
-        CandidateResult* primary = nullptr;
+        // 장애물 있을 때: 안전성 최우선, 그 다음 비용 최소화
         
+        // 1단계: 안전한 경로들만 수집
+        std::vector<CandidateResult*> safe_candidates;
         for (auto& c : candidates) {
-            if (c.collided || c.out_of_track) continue;
-            if (c.cost < best_cost) {
-                best_cost = c.cost;
-                primary = &c;
+            if (!c.collided && !c.out_of_track) {
+                safe_candidates.push_back(&c);
             }
         }
         
-        if (!primary) {
-            // 모두 충돌 시 cost 최소 (충돌 경로 포함)
-            auto it = std::min_element(candidates.begin(), candidates.end(),
-                [](const auto& a, const auto& b) { return a.cost < b.cost; });
-            primary = (it != candidates.end() ? &*it : nullptr);
+        if (!safe_candidates.empty()) {
+            // 안전한 경로 중에서 최적 선택
+            CandidateResult* best_safe = nullptr;
+            double best_cost = std::numeric_limits<double>::infinity();
+            
+            // 우선순위: raceline > cost 최소
+            for (auto* candidate : safe_candidates) {
+                // raceline 우선 검사
+                if (std::abs(candidate->d_offset) < 0.05) {
+                    RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+                        "[SAFE RACELINE] Found safe raceline in obstacle situation, cost=%.3f", candidate->cost);
+                    return candidate;
+                }
+                
+                // 비용 기반 선택
+                if (candidate->cost < best_cost) {
+                    best_cost = candidate->cost;
+                    best_safe = candidate;
+                }
+            }
+            
+            if (best_safe) {
+                RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+                    "[SAFE PATH] Selected safe path in obstacle situation: offset=%.3f, cost=%.3f", 
+                    best_safe->d_offset, best_safe->cost);
+                return best_safe;
+            }
         }
         
-        return primary;
+        // 2단계: 안전한 경로가 없을 때만 위험한 경로 고려
+        RCLCPP_ERROR(rclcpp::get_logger("path_selector"), 
+            "[EMERGENCY] No safe paths available! Selecting least dangerous option");
+        
+        auto it = std::min_element(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { 
+                // 트랙 내부 경로 우선, 그 다음 cost 기준
+                if (a.out_of_track != b.out_of_track) {
+                    return !a.out_of_track;  // 트랙 내부가 우선
+                }
+                return a.cost < b.cost; 
+            });
+        
+        return (it != candidates.end() ? &*it : nullptr);
     } else {
         // 장애물이 없을 때: raceline 우선, 없으면 cost 기반 선택
         if (raceline_candidate) {
@@ -215,8 +321,27 @@ bool PathSelector::shouldAllowSwitch(
     }
     
     if (config_.path_length_commit_mode) {
-        // 경로 길이 기반 커밋: 경로 끝에 도달했는지 확인
-        return (current_s >= commit_state_.committed_path_end_s);
+        // 경로 길이 기반 커밋: 장애물 상황에서 더 보수적인 해제
+        bool basic_length_reached = (current_s >= commit_state_.committed_path_end_s);
+        
+        // 장애물 상황에서 커밋된 경우, 추가 안전 조건 확인
+        if (commit_state_.committed_during_obstacle) {
+            // 기본 길이는 도달했지만, 여전히 장애물이 있는 경우 커밋 유지
+            if (basic_length_reached && has_obstacles) {
+                RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
+                    "[OBSTACLE SAFETY] Basic length reached but obstacles still present - maintaining commit");
+                return false;  // 커밋 유지
+            }
+            
+            // 장애물이 없어졌을 때만 해제 허용
+            if (basic_length_reached && !has_obstacles) {
+                RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+                    "[OBSTACLE SAFETY] Length reached and obstacles cleared - allowing switch");
+                return true;
+            }
+        }
+        
+        return basic_length_reached;
     } else {
         // 기존 시간/거리 기반 커밋 로직
         double progress = current_s - commit_state_.commit_start_s;

@@ -40,9 +40,10 @@ struct PathSelectionConfig {
     double reference_offset_target = 0.0;          // 기본 복귀 목표 offset
     double reference_offset_tolerance = 0.03;      // reference로 간주하는 tolerance
     
-    // 경로 길이 기반 커밋 (더 짧은 경로로 빠른 재계획)
+    // 경로 길이 기반 커밋 (장애물 회피 지속성 강화)
     bool path_length_commit_mode = true;           // 경로 길이 기반 커밋 활성화
-    double path_length = 2.0;                     // 커밋 경로 길이 (m) - 절반으로 단축
+    double path_length = 4.0;                     // 커밋 경로 길이 (m) - 장애물 회피 안정성 향상
+    double obstacle_path_length_multiplier = 1.5;  // 장애물 상황에서 경로 길이 배수
 };
 
 struct PathCommitState {
@@ -54,6 +55,8 @@ struct PathCommitState {
     double commit_start_s = 0.0;
     rclcpp::Time commit_start_time;
     double committed_path_end_s = 0.0;
+    bool committed_during_obstacle = false;  // 장애물 상황에서 커밋되었는지
+    double obstacle_commit_extra_distance = 0.0;  // 장애물 상황 추가 거리
 };
 
 struct DetourState {

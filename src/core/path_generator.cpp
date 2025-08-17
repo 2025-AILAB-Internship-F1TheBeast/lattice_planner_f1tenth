@@ -401,10 +401,12 @@ double PathGenerator::calculate_path_cost(
     }
     curvature_cost_normalized = std::min(1.0, max_curvature_in_path / config_.max_curvature);
     
-    // 3. 장애물 관련 비용 (정규화된 시스템)
+    // 3. 장애물 관련 비용 (FORWARD LOOK-AHEAD 시스템)
     double obstacle_cost_normalized = 0.0;
     if (!obstacles.empty()) {
         double max_obstacle_cost = 0.0;
+        
+        // A. 경로상의 점들에서 장애물 비용 계산 (기존)
         for (const auto& point : path.points) {
             for (const auto& obstacle : obstacles) {
                 double dx = point.x - obstacle.x;
@@ -417,8 +419,47 @@ double PathGenerator::calculate_path_cost(
                 }
             }
         }
+        
+        // B. FORWARD PROJECTION: 경로 연장해서 미래 장애물 영향 계산
+        if (!path.points.empty()) {
+            const auto& last_point = path.points.back();
+            double look_ahead_distance = 8.0;  // 8m 앞까지 예측
+            int projection_steps = 20;  // 20개 점으로 분할
+            
+            for (int i = 1; i <= projection_steps; ++i) {
+                double step_distance = (look_ahead_distance / projection_steps) * i;
+                
+                // 경로 방향으로 연장된 점 계산
+                double projected_x = last_point.x + step_distance * std::cos(last_point.yaw);
+                double projected_y = last_point.y + step_distance * std::sin(last_point.yaw);
+                
+                // 연장된 점에서 장애물까지 거리 계산
+                for (const auto& obstacle : obstacles) {
+                    double dx = projected_x - obstacle.x;
+                    double dy = projected_y - obstacle.y;
+                    double distance = std::sqrt(dx*dx + dy*dy);
+                    
+                    // 더 먼 거리의 장애물도 비용에 반영 (가중치 감소)
+                    if (distance < config_.obstacle_detection_range) {
+                        double future_weight = 1.0 - (step_distance / look_ahead_distance);  // 거리별 가중치
+                        double point_cost = future_weight * (1.0 / (distance + 0.1));
+                        max_obstacle_cost = std::max(max_obstacle_cost, point_cost);
+                    }
+                }
+            }
+        }
+        
         // 정규화: 최대 예상 비용 10.0으로 나누어 0-1 범위로 변환
         obstacle_cost_normalized = std::min(1.0, max_obstacle_cost / 10.0);
+        
+        // Debug: 장애물 전방 예측 비용 로깅
+        static int obs_log_count = 0;
+        if (obs_log_count < 3) {
+            RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+                "[FORWARD PREDICTION] lateral_offset=%.3f, obstacle_cost=%.3f", 
+                path.lateral_offset, obstacle_cost_normalized);
+            obs_log_count++;
+        }
     }
     
     // === 가중치 합을 통한 최종 비용 계산 ===

@@ -84,17 +84,54 @@ bool LatticePlanner::initialize() {
     path_generator_ = std::make_shared<PathGenerator>(config_);
     path_generator_->set_frenet_coordinate(frenet_coord_);
     
-    // Initialize new obstacle detector and path selector
+    // Initialize enhanced LiDAR obstacle detector
     advanced::ObstacleDetectionConfig obs_config;
-    obs_config.max_detection_range = 8.0;
-    obs_config.forward_distance_max = 6.0;
-    obs_config.lateral_distance_max = 3.0;
-    obs_config.proximity_search_radius = 3.0;  // 3m 범위로 확장된 근접 탐지
+    // 기본 감지 설정 - 향상된 범위
+    obs_config.max_detection_range = 8.0;         // 더 넓은 감지 범위
+    obs_config.lateral_range = M_PI / 2.0;        // 180도 시야각
+    obs_config.forward_distance_max = 6.0;       // 전방 6m
+    obs_config.lateral_distance_max = 3.0;       // 좌우 3m
+    
+    // 라이다 전처리 설정
+    obs_config.min_range_threshold = 0.1;        // 최소 거리
+    obs_config.max_range_threshold = 10.0;       // 최대 거리
+    obs_config.median_filter_size = 3;           // 노이즈 제거
+    obs_config.outlier_threshold = 0.5;          // 이상치 제거
+    
+    // 클러스터링 설정
+    obs_config.cluster_distance_threshold = 0.3; // 클러스터링 거리
+    obs_config.min_cluster_size = 3;             // 최소 클러스터 크기
+    obs_config.min_obstacle_size = 0.05;         // 최소 장애물 크기
+    obs_config.max_obstacle_size = 3.0;          // 최대 장애물 크기
+    
+    // 동적 장애물 추적 설정
+    obs_config.tracking_distance_threshold = 0.5; // 추적 거리
+    obs_config.max_lost_frames = 5;              // 최대 손실 프레임
+    obs_config.velocity_estimation_window = 0.5; // 속도 추정 윈도우
+    obs_config.min_dynamic_velocity = 0.3;       // 동적 판정 속도
+    
+    // Occupancy grid 설정
+    obs_config.occupancy_threshold = 40;         // 임계값 완화
+    obs_config.occupancy_inflation_radius = 0.3; // 팽창 반경
+    obs_config.proximity_search_radius = 2.5;    // 근접 탐지 범위
+    obs_config.unknown_is_obstacle = false;      // 미지 영역은 장애물 아님
+    
     advanced_obstacle_detector_ = std::make_unique<advanced::ObstacleDetector>(obs_config);
     
+    // 안전한 경로 선택을 위한 향상된 설정
     advanced::PathSelectionConfig sel_config;
     sel_config.commit_min_progress = 1.0;
     sel_config.commit_min_time_sec = 0.8;
+    
+    // 장애물 회피 지속성 강화
+    sel_config.path_length = 4.0;                       // 기본 커밋 길이 증가
+    sel_config.obstacle_path_length_multiplier = 1.5;   // 장애물 상황에서 1.5배 연장
+    sel_config.path_length_commit_mode = true;          // 경로 길이 기반 커밋 활성화
+    
+    // 더 안정적인 detour 설정
+    sel_config.detour_return_clear_frames_threshold = 8; // 더 많은 프레임 확인 후 복귀
+    sel_config.reference_offset_tolerance = 0.05;       // raceline 허용 범위 약간 확대
+    
     path_selector_ = std::make_unique<advanced::PathSelector>(sel_config);
     
     // Keep old detector for compatibility
@@ -112,8 +149,9 @@ bool LatticePlanner::initialize() {
     
     // Initialize subscribers
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/odom", 10, 
+        "/pf/pose/odom", 10, 
         std::bind(&LatticePlanner::odom_callback, this, std::placeholders::_1));
+
     
     laser_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
         "/scan", 10,
@@ -217,9 +255,27 @@ void LatticePlanner::laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr
         vehicle_yaw = vehicle_yaw_;
     }
     
-    // Use new advanced obstacle detector
+    // Use enhanced advanced obstacle detector
     advanced_obstacle_detector_->detectObstaclesFromScan(
         msg, vehicle_pos.x, vehicle_pos.y, vehicle_yaw, this->get_clock());
+    
+    // Get enhanced obstacle information
+    auto tracked_obstacles = advanced_obstacle_detector_->getTrackedObstacles();
+    auto dynamic_obstacles = advanced_obstacle_detector_->getDynamicObstacles();
+    auto static_obstacles = advanced_obstacle_detector_->getStaticObstacles();
+    
+    // Enhanced logging with obstacle details
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[ENHANCED LIDAR] Tracked: %zu, Dynamic: %zu, Static: %zu obstacles", 
+        tracked_obstacles.size(), dynamic_obstacles.size(), static_obstacles.size());
+    
+    if (!dynamic_obstacles.empty()) {
+        for (const auto& obs : dynamic_obstacles) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+                "[DYNAMIC OBSTACLE] ID:%d at (%.2f,%.2f), vel:(%.2f,%.2f) m/s, size:%.2f", 
+                obs.track_id, obs.x, obs.y, obs.velocity_x, obs.velocity_y, obs.size);
+        }
+    }
     
     // Keep old detector for compatibility
     current_obstacles_ = obstacle_detector_->detect_from_laser_scan(
@@ -307,6 +363,12 @@ void LatticePlanner::plan_paths() {
     
     // Publish selected path
     publish_selected_path(selected_path);
+
+     // Debug: Log selected path info
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "[SELECTED PATH] lateral_offset=%.3f, points=%zu, safe=%s, cost=%.3f", 
+        selected_path.lateral_offset, selected_path.points.size(), 
+        selected_path.is_safe ? "YES" : "NO", selected_path.cost);
     
     // Publish visualization
     publish_path_visualization(candidates, selected_path);
@@ -350,197 +412,182 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
         
         double original_cost = result.cost;
         
-        // Enhanced cost calculation with obstacle detection
+        // IMMEDIATE COLLISION DETECTION: 현재 경로만 체크 (미래 예측 완전 제거)
         if (!result.path_points.empty()) {
-            double obstacle_cost = advanced_obstacle_detector_->calculateOccupancyCost(result.path_points);
-            bool path_collides = advanced_obstacle_detector_->pathCollides(result.path_points);
+            // 현재 경로에서만 직접 충돌 체크 - 미래 연장 완전 제거
+            bool direct_collision = advanced_obstacle_detector_->pathCollides(result.path_points);
+            double base_obstacle_cost = advanced_obstacle_detector_->calculateOccupancyCost(result.path_points);
             
-            result.cost += obstacle_cost;
-            result.collided = result.collided || path_collides;
+            // 충돌 시에만 페널티 적용 (미래 예측 제거로 현재 안전 경로 보호)
+            if (direct_collision) {
+                base_obstacle_cost += 100.0;  // 실제 충돌에만 큰 페널티
+                RCLCPP_ERROR(this->get_logger(), "[IMMEDIATE COLLISION] Path %zu (offset=%.3f) has REAL collision NOW!", 
+                           i, candidate.lateral_offset);
+            }
             
-            // Enhanced logging for collision detection
-            RCLCPP_INFO(this->get_logger(), "[COLLISION CHECK] Candidate %zu: lateral_offset=%.3f, occupancy_cost=%.3f, path_collides=%s, total_collided=%s", 
-                       i, candidate.lateral_offset, obstacle_cost, 
-                       path_collides ? "YES" : "NO",
-                       result.collided ? "YES" : "NO");
+            result.cost += base_obstacle_cost;
+            result.collided = result.collided || direct_collision;
+            
+            // 상세 로깅 (미래 예측 제거)
+            RCLCPP_INFO(this->get_logger(), "[IMMEDIATE CHECK] Path %zu: offset=%.3f, collision=%s, cost=%.3f", 
+                       i, candidate.lateral_offset, 
+                       direct_collision ? "YES" : "NO", 
+                       base_obstacle_cost);
         }
         
         advanced_candidates.push_back(result);
     }
     
-    // OBSTACLE-AWARE RACELINE SELECTION: Prefer longer/faster paths when obstacles detected
-    bool obstacles_ahead = advanced_obstacle_detector_->hasObstacles(vehicle_pos.x, vehicle_pos.y);
+    // SIMPLE PATH SELECTION: 복잡한 로직 제거하고 단순하게
+    double min_cost = std::numeric_limits<double>::max();
+    size_t best_idx = 0;
+    bool found_safe_path = false;
     
-    size_t raceline_candidate = std::numeric_limits<size_t>::max();
-    bool found_safe_raceline = false;
+    RCLCPP_WARN(this->get_logger(), "[PATH SELECTION] Starting with %zu candidates", candidates.size());
     
-    // If obstacles detected, prefer higher velocity paths for better look-ahead
-    if (obstacles_ahead) {
-        RCLCPP_WARN(this->get_logger(), "[OBSTACLE AHEAD] Obstacles detected, prioritizing longer/faster paths");
+    // 1단계: 안전한 경로들만 필터링
+    std::vector<size_t> safe_indices;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        bool is_safe = candidates[i].is_safe && !advanced_candidates[i].collided;
         
-        // Find the longest/fastest safe raceline path
-        double best_path_length = 0.0;
+        RCLCPP_WARN(this->get_logger(), "[PATH %zu] offset=%.3f, cost=%.3f, safe=%s, collided=%s -> %s", 
+                   i, candidates[i].lateral_offset, advanced_candidates[i].cost, 
+                   candidates[i].is_safe ? "YES" : "NO", 
+                   advanced_candidates[i].collided ? "YES" : "NO",
+                   is_safe ? "SAFE" : "UNSAFE");
+        
+        if (is_safe) {
+            safe_indices.push_back(i);
+        }
+    }
+    
+    if (safe_indices.empty()) {
+        RCLCPP_ERROR(this->get_logger(), "[EMERGENCY] No safe paths found! Using cost-based fallback");
+        // 안전한 경로가 없으면 최소 비용 선택
         for (size_t i = 0; i < candidates.size(); ++i) {
-            if (std::abs(candidates[i].lateral_offset) < 0.05 && // raceline candidate
-                candidates[i].is_safe && !advanced_candidates[i].collided) {
-                
-                // Calculate path length
-                double path_length = 0.0;
-                if (!candidates[i].points.empty()) {
-                    const auto& last_point = candidates[i].points.back();
-                    const auto& first_point = candidates[i].points.front();
-                    path_length = std::sqrt(
-                        std::pow(last_point.x - first_point.x, 2) + 
-                        std::pow(last_point.y - first_point.y, 2));
-                }
-                
-                if (path_length > best_path_length) {
-                    best_path_length = path_length;
-                    raceline_candidate = i;
-                    found_safe_raceline = true;
-                    RCLCPP_INFO(this->get_logger(), "[LONG PATH] Selected longer raceline: candidate %zu, length=%.2fm", i, path_length);
-                }
+            if (advanced_candidates[i].cost < min_cost) {
+                min_cost = advanced_candidates[i].cost;
+                best_idx = i;
+                found_safe_path = true;
             }
         }
     } else {
-        // No obstacles: use standard raceline selection
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            if (std::abs(candidates[i].lateral_offset) < 0.05) { // raceline candidate
-            RCLCPP_INFO(this->get_logger(), "[RACELINE DEBUG] Checking raceline candidate %zu:", i);
-            RCLCPP_INFO(this->get_logger(), "  - is_safe: %s", candidates[i].is_safe ? "true" : "false");
-            RCLCPP_INFO(this->get_logger(), "  - advanced_collided: %s", advanced_candidates[i].collided ? "true" : "false");
-            RCLCPP_INFO(this->get_logger(), "  - lateral_offset: %.6f", candidates[i].lateral_offset);
-            
-            // Additional check: ensure raceline path has reasonable curvature for corners
-            double max_curvature = 0.0;
-            for (const auto& point : candidates[i].points) {
-                max_curvature = std::max(max_curvature, std::abs(point.curvature));
-            }
-            RCLCPP_INFO(this->get_logger(), "  - max_curvature: %.3f", max_curvature);
-            
-            // ONLY select raceline if it's collision-free (check BOTH old and new collision detection)
-            bool is_collision_free = candidates[i].is_safe && !advanced_candidates[i].collided;
-            bool curvature_ok = max_curvature < 0.8;
-            
-            RCLCPP_INFO(this->get_logger(), "  - is_collision_free: %s", is_collision_free ? "true" : "false");
-            RCLCPP_INFO(this->get_logger(), "  - curvature_ok: %s", curvature_ok ? "true" : "false");
-            
-            if (is_collision_free && curvature_ok) {
-                raceline_candidate = i;
-                found_safe_raceline = true;
-                RCLCPP_INFO(this->get_logger(), "[SAFE RACELINE] Safe raceline found: candidate %zu", raceline_candidate);
+        RCLCPP_INFO(this->get_logger(), "[SAFE PATHS] Found %zu safe paths", safe_indices.size());
+        
+        // 2단계: 안전한 경로들 중에서 레이스라인 우선, 그 다음 최소 비용
+        bool found_raceline = false;
+        
+        // 레이스라인 우선 검색 (d ≈ 0)
+        for (size_t idx : safe_indices) {
+            if (std::abs(candidates[idx].lateral_offset) < 0.1) {  // raceline
+                best_idx = idx;
+                found_safe_path = true;
+                found_raceline = true;
+                RCLCPP_WARN(this->get_logger(), "[RACELINE SELECTED] Path %zu with offset %.3f", idx, candidates[idx].lateral_offset);
                 break;
-            } else {
-                RCLCPP_WARN(this->get_logger(), "[COLLISION DETECTED] Raceline candidate %zu has collision (is_safe=%s, advanced_collided=%s), skipping", 
-                           i, candidates[i].is_safe ? "true" : "false", 
-                           advanced_candidates[i].collided ? "true" : "false");
             }
+        }
+        
+        // 레이스라인이 없으면 최소 비용 선택
+        if (!found_raceline) {
+            for (size_t idx : safe_indices) {
+                if (advanced_candidates[idx].cost < min_cost) {
+                    min_cost = advanced_candidates[idx].cost;
+                    best_idx = idx;
+                    found_safe_path = true;
+                }
+            }
+            RCLCPP_WARN(this->get_logger(), "[COST SELECTED] Path %zu with cost %.3f", best_idx, min_cost);
         }
     }
     
-    // Only use raceline if it's safe
-    if (found_safe_raceline && raceline_candidate != std::numeric_limits<size_t>::max()) {
-        RCLCPP_INFO(this->get_logger(), "[SAFE RACELINE] Using safe raceline: candidate %zu", raceline_candidate);
-        return candidates[raceline_candidate];
-    } else {
-        RCLCPP_WARN(this->get_logger(), "[NO SAFE RACELINE] No collision-free raceline available, using path selector");
-    }
-    
-    // Use advanced path selector
-    bool has_obstacles = advanced_obstacle_detector_->hasObstacles(vehicle_pos.x, vehicle_pos.y);
-    double current_s = 0.0; // TODO: calculate current arc length position
-    
-    RCLCPP_INFO(this->get_logger(), "[DEBUG] has_obstacles=%s, vehicle_pos=(%.2f, %.2f)", 
-               has_obstacles ? "true" : "false", vehicle_pos.x, vehicle_pos.y);
-    
-    // SAFETY OVERRIDE: If obstacles detected, force has_obstacles=false to prevent raceline recovery
-    bool safe_has_obstacles = false; // Disable raceline recovery by forcing no obstacles
-    RCLCPP_WARN(this->get_logger(), "[SAFETY OVERRIDE] Disabling raceline recovery to prioritize safety");
-    
-    auto* selected = path_selector_->selectOptimalPath(
-        advanced_candidates, safe_has_obstacles, current_s, this->get_clock());
-    
-    if (selected) {
-        // SAFETY CHECK: Reject selected path if it's raceline with collision
-        bool is_selected_raceline = std::abs(selected->d_offset) < 0.05;
-        if (is_selected_raceline && selected->collided) {
-            RCLCPP_ERROR(this->get_logger(), "[SAFETY OVERRIDE] Path selector chose collision raceline, rejecting and using fallback");
-            selected = nullptr; // Force fallback selection
-        } else {
-            path_selector_->updateCommitState(selected, current_s, this->get_clock());
+    if (found_safe_path) {
+        // 🚨 최종 안전성 재검증
+        const auto& final_choice = candidates[best_idx];
+        if (!final_choice.is_safe || (best_idx < advanced_candidates.size() && 
+            (advanced_candidates[best_idx].collided || advanced_candidates[best_idx].out_of_track))) {
             
-            // Find corresponding original candidate
+            RCLCPP_FATAL(this->get_logger(), 
+                "🚨🚨🚨 [SAFETY VIOLATION] Final choice is UNSAFE! offset=%.3f, is_safe=%s", 
+                final_choice.lateral_offset, final_choice.is_safe ? "true" : "false");
+            
+            // 다시 안전한 경로 찾기
             for (size_t i = 0; i < candidates.size(); ++i) {
-                if (&advanced_candidates[i] == selected) {
-                    RCLCPP_INFO(this->get_logger(), "[DEBUG] Selected advanced candidate %zu with cost=%.3f, collided=%s", 
-                               i, selected->cost, selected->collided ? "true" : "false");
+                if (candidates[i].is_safe && i < advanced_candidates.size() && 
+                    !advanced_candidates[i].collided && !advanced_candidates[i].out_of_track) {
+                    RCLCPP_WARN(this->get_logger(), 
+                        "🛡️ [SAFETY RECOVERY] Using verified safe path %zu: offset=%.3f", 
+                        i, candidates[i].lateral_offset);
                     return candidates[i];
                 }
             }
+            
+            RCLCPP_FATAL(this->get_logger(), "💀 [CRITICAL] NO SAFE PATHS FOUND!");
+            return PathCandidate();  // 빈 경로 반환
         }
-    } else {
-        RCLCPP_WARN(this->get_logger(), "[DEBUG] Advanced path selector returned null, falling back to simple selection");
+        
+        RCLCPP_ERROR(this->get_logger(), 
+            "✅ [FINAL SELECTION] *** VERIFIED SAFE PATH %zu: offset=%.3f, cost=%.3f ***", 
+            best_idx, final_choice.lateral_offset, 
+            best_idx < advanced_candidates.size() ? advanced_candidates[best_idx].cost : -1.0);
+        
+        return final_choice;
     }
     
-    // Fallback to collision-aware cost-based selection
-    double min_cost = std::numeric_limits<double>::max();
-    size_t best_idx = 0;
-    
-    // First priority: Find collision-free paths only
+    // If no safe path found, emergency selection
+    RCLCPP_ERROR(this->get_logger(), "[EMERGENCY] No collision-free path found! Selecting best available path");
+    min_cost = std::numeric_limits<double>::max();
     for (size_t i = 0; i < candidates.size(); ++i) {
-        bool is_collision_free = candidates[i].is_safe && !advanced_candidates[i].collided;
-        if (is_collision_free && candidates[i].cost < min_cost) {
-            min_cost = candidates[i].cost;
+        if (advanced_candidates[i].cost < min_cost) {
+            min_cost = advanced_candidates[i].cost;
             best_idx = i;
         }
     }
     
-    // If no collision-free path found, emergency selection (prefer safest path)
-    if (min_cost == std::numeric_limits<double>::max()) {
-        RCLCPP_ERROR(this->get_logger(), "[EMERGENCY] No collision-free path found! Selecting safest available path");
-        min_cost = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            // Choose path with least collision risk (prioritize is_safe over occupancy collision)
-            double emergency_cost = candidates[i].cost;
-            if (advanced_candidates[i].collided) emergency_cost += 10000.0; // Heavy penalty for occupancy collision
-            if (!candidates[i].is_safe) emergency_cost += 5000.0; // Penalty for other collision
-            
-            if (emergency_cost < min_cost) {
-                min_cost = emergency_cost;
-                best_idx = i;
-            }
-        }
-        RCLCPP_ERROR(this->get_logger(), "[EMERGENCY] Selected path %zu with collision risk", best_idx);
-    } else {
-        RCLCPP_INFO(this->get_logger(), "[FALLBACK] Selected collision-free path %zu", best_idx);
-    }
-    
+    RCLCPP_WARN(this->get_logger(), "[EMERGENCY] Selected path %zu: lateral_offset=%.3f, cost=%.3f", 
+               best_idx, candidates[best_idx].lateral_offset, min_cost);
     return candidates[best_idx];
 }
 
 void LatticePlanner::publish_selected_path(const PathCandidate& path) {
-    if (path.points.empty()) return;
+    if (path.points.empty()) {
+        RCLCPP_ERROR(this->get_logger(), "[PUBLISH ERROR] Empty path, not publishing anything!");
+        return;
+    }
     
-    // Publish path as nav_msgs::Path (for backward compatibility)
+    RCLCPP_ERROR(this->get_logger(), "[PUBLISH START] Publishing path with %zu points, lateral_offset=%.3f", 
+                path.points.size(), path.lateral_offset);
+    
+    // Publish path as nav_msgs::Path (for path_follower)
     auto nav_path = convert_to_nav_path(path);
     path_pub_->publish(nav_path);
     
-    // Publish path as PathWithVelocity (for velocity-aware path following)
+    // Publish path as PathWithVelocity (for velocity-aware control)
     auto velocity_path = convert_to_path_with_velocity(path);
     path_with_velocity_pub_->publish(velocity_path);
     
-    // Log velocity path information for debugging
-    if (!velocity_path.points.empty()) {
-        double avg_velocity = 0.0;
-        for (const auto& point : velocity_path.points) {
-            avg_velocity += point.velocity;
-        }
-        avg_velocity /= velocity_path.points.size();
-        
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-            "[VELOCITY PUBLISH] PathWithVelocity published: %zu points, avg_vel=%.2f, max_vel=%.2f", 
-            velocity_path.points.size(), avg_velocity, velocity_path.max_velocity);
+    // 첫 번째와 마지막 점 로깅
+    if (nav_path.poses.size() >= 2) {
+        const auto& first = nav_path.poses.front();
+        const auto& last = nav_path.poses.back();
+        RCLCPP_ERROR(this->get_logger(), 
+            "[PUBLISH DETAILS] nav_path: %zu points, first=(%.2f,%.2f), last=(%.2f,%.2f)",
+            nav_path.poses.size(), 
+            first.pose.position.x, first.pose.position.y,
+            last.pose.position.x, last.pose.position.y);
     }
+    
+    if (velocity_path.points.size() >= 2) {
+        const auto& first_vel = velocity_path.points.front();
+        const auto& last_vel = velocity_path.points.back();
+        RCLCPP_ERROR(this->get_logger(), 
+            "[PUBLISH DETAILS] velocity_path: %zu points, first=(%.2f,%.2f,v=%.2f), last=(%.2f,%.2f,v=%.2f)",
+            velocity_path.points.size(), 
+            first_vel.x, first_vel.y, first_vel.velocity,
+            last_vel.x, last_vel.y, last_vel.velocity);
+    }
+    
+    RCLCPP_ERROR(this->get_logger(), "[PUBLISH SUCCESS] Both topics published successfully!");
 }
 
 void LatticePlanner::publish_path_visualization(
