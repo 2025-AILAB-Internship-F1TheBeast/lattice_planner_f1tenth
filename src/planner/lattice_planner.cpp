@@ -35,15 +35,18 @@ bool LatticePlanner::initialize() {
     this->declare_parameter("path_resolution", 0.1);
     this->declare_parameter("lateral_step", 0.5);
     this->declare_parameter("max_lateral_offset", 2.0);
-    this->declare_parameter("planning_horizon", 3.0);
+    this->declare_parameter("planning_horizon", 2.0);
     this->declare_parameter("dt", 0.1);
-    this->declare_parameter("max_velocity", 10.0);
+    this->declare_parameter("max_velocity", 8.0);
     this->declare_parameter("planning_frequency", 10.0);
     this->declare_parameter("max_curvature", 1.0);
     this->declare_parameter("lateral_cost_weight", 1.0);
     this->declare_parameter("curvature_cost_weight", 1.0);
     this->declare_parameter("longitudinal_cost_weight", 0.1);
     this->declare_parameter("obstacle_cost_weight", 10.0);
+    this->declare_parameter("obstacle_existence_weight", 3.0);
+    this->declare_parameter("unknown_area_weight", 1.0);
+    this->declare_parameter("obstacle_distance_weight", 2.0);
     this->declare_parameter("occupancy_grid_topic", std::string("/dynamic_map"));
     
     config_.reference_path_file = this->get_parameter("reference_path_file").as_string();
@@ -58,6 +61,9 @@ bool LatticePlanner::initialize() {
     config_.curvature_cost_weight = this->get_parameter("curvature_cost_weight").as_double();
     config_.longitudinal_cost_weight = this->get_parameter("longitudinal_cost_weight").as_double();
     config_.obstacle_cost_weight = this->get_parameter("obstacle_cost_weight").as_double();
+    config_.obstacle_existence_weight = this->get_parameter("obstacle_existence_weight").as_double();
+    config_.unknown_area_weight = this->get_parameter("unknown_area_weight").as_double();
+    config_.obstacle_distance_weight = this->get_parameter("obstacle_distance_weight").as_double();
     
     double planning_frequency = this->get_parameter("planning_frequency").as_double();
     std::string occupancy_grid_topic = this->get_parameter("occupancy_grid_topic").as_string();
@@ -83,6 +89,7 @@ bool LatticePlanner::initialize() {
     obs_config.max_detection_range = 8.0;
     obs_config.forward_distance_max = 6.0;
     obs_config.lateral_distance_max = 3.0;
+    obs_config.proximity_search_radius = 3.0;  // 3m 범위로 확장된 근접 탐지
     advanced_obstacle_detector_ = std::make_unique<advanced::ObstacleDetector>(obs_config);
     
     advanced::PathSelectionConfig sel_config;
@@ -222,6 +229,12 @@ void LatticePlanner::laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr
 void LatticePlanner::grid_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
     if (!odom_received_) return;
     
+    // Store the current grid for track boundary detection
+    {
+        std::lock_guard<std::mutex> grid_lock(grid_mutex_);
+        current_grid_ = msg;
+    }
+    
     std::lock_guard<std::mutex> lock(obstacles_mutex_);
     
     Point2D vehicle_pos;
@@ -288,6 +301,7 @@ void LatticePlanner::plan_paths() {
         return;
     }
     
+    
     // Select best path
     PathCandidate selected_path = select_best_path(candidates);
     
@@ -321,9 +335,8 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
         result.cost = candidate.cost;
         result.collided = !candidate.is_safe;
         
-        // Check if path is out of track (assuming F1TENTH track width ~3.5m)
-        bool out_of_track = std::abs(candidate.lateral_offset) > 1.75; // Half track width
-        result.out_of_track = out_of_track;
+        // Use already computed out_of_track flag
+        result.out_of_track = candidate.out_of_track;
         result.d_offset = candidate.lateral_offset; // Set the actual lateral offset
         
         // Convert PathPoint to geometry_msgs::Point
@@ -355,12 +368,44 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
         advanced_candidates.push_back(result);
     }
     
-    // SAFE RACELINE PREFERENCE: Only select raceline if it's collision-free
+    // OBSTACLE-AWARE RACELINE SELECTION: Prefer longer/faster paths when obstacles detected
+    bool obstacles_ahead = advanced_obstacle_detector_->hasObstacles(vehicle_pos.x, vehicle_pos.y);
+    
     size_t raceline_candidate = std::numeric_limits<size_t>::max();
     bool found_safe_raceline = false;
     
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        if (std::abs(candidates[i].lateral_offset) < 0.05) { // raceline candidate
+    // If obstacles detected, prefer higher velocity paths for better look-ahead
+    if (obstacles_ahead) {
+        RCLCPP_WARN(this->get_logger(), "[OBSTACLE AHEAD] Obstacles detected, prioritizing longer/faster paths");
+        
+        // Find the longest/fastest safe raceline path
+        double best_path_length = 0.0;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (std::abs(candidates[i].lateral_offset) < 0.05 && // raceline candidate
+                candidates[i].is_safe && !advanced_candidates[i].collided) {
+                
+                // Calculate path length
+                double path_length = 0.0;
+                if (!candidates[i].points.empty()) {
+                    const auto& last_point = candidates[i].points.back();
+                    const auto& first_point = candidates[i].points.front();
+                    path_length = std::sqrt(
+                        std::pow(last_point.x - first_point.x, 2) + 
+                        std::pow(last_point.y - first_point.y, 2));
+                }
+                
+                if (path_length > best_path_length) {
+                    best_path_length = path_length;
+                    raceline_candidate = i;
+                    found_safe_raceline = true;
+                    RCLCPP_INFO(this->get_logger(), "[LONG PATH] Selected longer raceline: candidate %zu, length=%.2fm", i, path_length);
+                }
+            }
+        }
+    } else {
+        // No obstacles: use standard raceline selection
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (std::abs(candidates[i].lateral_offset) < 0.05) { // raceline candidate
             RCLCPP_INFO(this->get_logger(), "[RACELINE DEBUG] Checking raceline candidate %zu:", i);
             RCLCPP_INFO(this->get_logger(), "  - is_safe: %s", candidates[i].is_safe ? "true" : "false");
             RCLCPP_INFO(this->get_logger(), "  - advanced_collided: %s", advanced_candidates[i].collided ? "true" : "false");
@@ -591,13 +636,9 @@ visualization_msgs::msg::MarkerArray LatticePlanner::create_path_markers(
     
     visualization_msgs::msg::MarkerArray markers;
     
-    // Clear previous markers
-    visualization_msgs::msg::Marker clear_marker;
-    clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;
-    markers.markers.push_back(clear_marker);
-    
     // Create markers for candidates
     for (size_t i = 0; i < candidates.size(); ++i) {
+        
         visualization_msgs::msg::Marker marker;
         marker.header.frame_id = "map";
         marker.header.stamp = this->get_clock()->now();
@@ -610,15 +651,17 @@ visualization_msgs::msg::MarkerArray LatticePlanner::create_path_markers(
         
         // Color coding: green for safe, red for unsafe
         if (candidates[i].is_safe) {
+            // Green for safe paths
             marker.color.r = 0.0;
             marker.color.g = 1.0;
             marker.color.b = 0.0;
-            marker.color.a = 0.5;
+            marker.color.a = 0.7;
         } else {
+            // Red for unsafe but in-track paths  
             marker.color.r = 1.0;
             marker.color.g = 0.0;
             marker.color.b = 0.0;
-            marker.color.a = 0.3;
+            marker.color.a = 0.4;
         }
         
         for (const auto& point : candidates[i].points) {
@@ -643,9 +686,11 @@ visualization_msgs::msg::MarkerArray LatticePlanner::create_path_markers(
         selected_marker.action = visualization_msgs::msg::Marker::ADD;
         
         selected_marker.scale.x = 0.1;  // Thicker line
+        
+        // Blue for selected path
         selected_marker.color.r = 0.0;
         selected_marker.color.g = 0.0;
-        selected_marker.color.b = 1.0;  // Blue
+        selected_marker.color.b = 1.0;
         selected_marker.color.a = 1.0;
         
         for (const auto& point : selected.points) {

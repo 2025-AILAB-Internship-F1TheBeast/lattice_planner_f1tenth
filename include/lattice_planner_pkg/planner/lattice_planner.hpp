@@ -65,6 +65,10 @@ private:
     std::vector<Obstacle> current_obstacles_;
     std::mutex obstacles_mutex_;
     
+    // Occupancy Grid for track boundary detection
+    nav_msgs::msg::OccupancyGrid::SharedPtr current_grid_;
+    std::mutex grid_mutex_;
+    
     // Reference path
     std::vector<RefPoint> reference_path_;
     

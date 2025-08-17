@@ -61,8 +61,9 @@ struct PathCandidate {
     double cost;
     double lateral_offset;
     bool is_safe;
+    bool out_of_track;
     
-    PathCandidate() : cost(0.0), lateral_offset(0.0), is_safe(true) {}
+    PathCandidate() : cost(0.0), lateral_offset(0.0), is_safe(true), out_of_track(false) {}
 };
 
 // Configuration structure
@@ -89,6 +90,11 @@ struct PlannerConfig {
     double obstacle_cost_weight;
     double curvature_cost_weight;
     
+    // Normalized weighted cost system
+    double obstacle_existence_weight;     // 장애물 존재 여부
+    double unknown_area_weight;          // 모르는 영역
+    double obstacle_distance_weight;     // 장애물 거리 기반
+    
     // Safety
     double safety_margin;
     double collision_radius;
@@ -108,6 +114,12 @@ struct PlannerConfig {
         longitudinal_cost_weight = 1.0;
         obstacle_cost_weight = 10.0;
         curvature_cost_weight = 1.0;
+        
+        // Normalized weighted cost system defaults
+        obstacle_existence_weight = 3.0;     // 장애물 존재 시 높은 패널티
+        unknown_area_weight = 1.0;          // 모르는 영역 적당한 패널티
+        obstacle_distance_weight = 2.0;     // 장애물 거리 기반 중간 가중치
+        
         safety_margin = 0.3;
         collision_radius = 0.5;
         obstacle_detection_range = 10.0;

@@ -101,12 +101,14 @@ bool ObstacleDetector::hasObstacles(double ego_x, double ego_y) const {
     return hasLidarObstacles() || hasOccupancyObstacles(ego_x, ego_y);
 }
 
-double ObstacleDetector::calculateOccupancyCost(const std::vector<geometry_msgs::msg::Point>& path_points) const {
+advanced::ObstacleDetector::NormalizedCosts ObstacleDetector::calculateNormalizedCosts(const std::vector<geometry_msgs::msg::Point>& path_points) const {
     std::lock_guard<std::mutex> lk(grid_mutex_);
-    if (!latest_grid_) return 0.0;
+    NormalizedCosts costs = {0.0, 0.0, 0.0};
+    
+    if (!latest_grid_) return costs;
     
     const auto & grid = *latest_grid_;
-    if (grid.info.resolution <= 0 || grid.info.width == 0 || grid.info.height == 0) return 0.0;
+    if (grid.info.resolution <= 0 || grid.info.width == 0 || grid.info.height == 0) return costs;
     
     double res = grid.info.resolution;
     int w = (int)grid.info.width;
@@ -114,16 +116,18 @@ double ObstacleDetector::calculateOccupancyCost(const std::vector<geometry_msgs:
     double origin_x = grid.info.origin.position.x;
     double origin_y = grid.info.origin.position.y;
     
-    double total_cost = 0.0;
+    int obstacle_points = 0;
+    int unknown_points = 0;
+    double total_proximity = 0.0;
     int valid_points = 0;
     
-    // 각 경로 포인트에 대해 cost 계산
+    // 각 경로 포인트에 대해 분석
     for (const auto &p : path_points) {
         int mx = (int)std::floor((p.x - origin_x) / res);
         int my = (int)std::floor((p.y - origin_y) / res);
         
         if (mx < 0 || my < 0 || mx >= w || my >= h) {
-            total_cost += 10.0; // 맵 밖은 높은 cost
+            obstacle_points++; // 맵 밖은 장애물로 취급
             valid_points++;
             continue;
         }
@@ -132,19 +136,40 @@ double ObstacleDetector::calculateOccupancyCost(const std::vector<geometry_msgs:
         
         if (v < 0) {
             // Unknown 영역
-            total_cost += 2.0;
+            unknown_points++;
         } else if (v >= config_.occupancy_threshold) {
-            // 장애물 - 매우 높은 비용으로 설정하여 선택되지 않도록 함
-            total_cost += 10000.0;
+            // 장애물
+            obstacle_points++;
         } else {
-            // 자유 공간 - 주변 장애물과의 거리 기반 cost
-            double proximity_cost = calculateProximityCost(mx, my, grid);
-            total_cost += proximity_cost;
+            // 자유 공간 - 주변 장애물과의 거리 계산
+            double proximity = calculateProximityCost(mx, my, grid);
+            total_proximity += proximity;
         }
         valid_points++;
     }
     
-    return valid_points > 0 ? total_cost / valid_points : 0.0;
+    if (valid_points > 0) {
+        // 정규화: 0-1 범위로 변환
+        costs.obstacle_existence = (double)obstacle_points / valid_points;
+        costs.unknown_area = (double)unknown_points / valid_points;
+        costs.obstacle_distance = total_proximity / (valid_points * 6.0); // 최대 proximity 6.0으로 정규화 (3m 범위)
+        costs.obstacle_distance = std::min(1.0, costs.obstacle_distance);
+    }
+    
+    return costs;
+}
+
+double ObstacleDetector::calculateOccupancyCost(const std::vector<geometry_msgs::msg::Point>& path_points) const {
+    // 기존 함수 유지 (하위 호환성)
+    NormalizedCosts norm_costs = calculateNormalizedCosts(path_points);
+    
+    // 가중치 합을 통한 최종 비용 계산
+    double weighted_cost = 
+        norm_costs.obstacle_existence * 3.0 +    // 장애물 존재 시 높은 가중치
+        norm_costs.unknown_area * 1.0 +         // 미지 영역 적당한 가중치
+        norm_costs.obstacle_distance * 2.0;     // 거리 기반 중간 가중치
+    
+    return weighted_cost;
 }
 
 bool ObstacleDetector::pathCollidesWithLidar(const std::vector<geometry_msgs::msg::Point>& path_points) const {
@@ -154,7 +179,7 @@ bool ObstacleDetector::pathCollidesWithLidar(const std::vector<geometry_msgs::ms
         for (const auto &obs : detected_obstacles_) {
             double dx = p.x - obs.x;
             double dy = p.y - obs.y;
-            if (dx*dx + dy*dy < 0.09) { // 0.3m 충돌 반경
+            if (dx*dx + dy*dy < 0.16) { // 0.4m 충돌 반경
                 return true;
             }
         }
@@ -217,7 +242,9 @@ bool ObstacleDetector::pathCollides(const std::vector<geometry_msgs::msg::Point>
 double ObstacleDetector::calculateProximityCost(int mx, int my, const nav_msgs::msg::OccupancyGrid& grid) const {
     int w = (int)grid.info.width;
     int h = (int)grid.info.height;
-    int search_radius = 3; // 3셀 반경
+    
+    // 설정 가능한 범위로 확장된 장애물 탐지 (해상도에 따라 동적 계산)
+    int search_radius = std::min(50, (int)std::ceil(config_.proximity_search_radius / grid.info.resolution));
     
     double min_distance = search_radius + 1;
     
@@ -237,9 +264,11 @@ double ObstacleDetector::calculateProximityCost(int mx, int my, const nav_msgs::
         }
     }
     
-    // 거리가 가까울수록 높은 cost
+    // 거리가 가까울수록 높은 cost (설정된 범위에서 정규화)
     if (min_distance <= search_radius) {
-        return (search_radius - min_distance) * 2.0;
+        // 설정된 범위에서 정규화된 비용 계산
+        double distance_ratio = min_distance / search_radius;
+        return (1.0 - distance_ratio) * 6.0; // 최대 6.0점, 가까울수록 높은 비용
     }
     return 0.0;
 }

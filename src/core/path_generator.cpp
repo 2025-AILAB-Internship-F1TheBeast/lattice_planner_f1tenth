@@ -254,10 +254,15 @@ PathCandidate PathGenerator::generate_single_path(
 std::vector<double> PathGenerator::generate_time_samples() const {
     std::vector<double> samples;
     
-    int num_samples = static_cast<int>(config_.planning_horizon / config_.dt) + 1;
+    // 차량 현재 위치부터 시작 (t=0 포함)
+    samples.push_back(0.0);  // 현재 위치에서 경로 분기 시작
     
-    for (int i = 0; i < num_samples; ++i) {
-        samples.push_back(i * config_.dt);
+    // 부드러운 시각화를 위한 조밀한 샘플링 (0.033초 간격)
+    double fine_dt = config_.dt / 3.0;  // 0.1초 -> 0.033초 간격
+    int num_samples = static_cast<int>(config_.planning_horizon / fine_dt);
+    
+    for (int i = 1; i <= num_samples; ++i) {
+        samples.push_back(i * fine_dt);
     }
     
     return samples;
@@ -382,40 +387,24 @@ double PathGenerator::calculate_path_cost(
         return std::numeric_limits<double>::max();
     }
     
-    double cost = 0.0;
+    // === 정규화된 비용 계산 시스템 ===
     
-    // Strong raceline preference but not extreme
-    if (std::abs(path.lateral_offset) < 0.05) {
-        // Almost raceline - give good bonus
-        cost = 0.0; // Start with zero cost for raceline
-    } else {
-        // Lateral deviation cost - moderate exponential penalty
-        double lateral_cost = std::pow(path.lateral_offset, 2) * config_.lateral_cost_weight * 5.0;
-        cost += lateral_cost;
-    }
+    // 1. 횡방향 편차 비용 (0-1 정규화)
+    double lateral_cost_normalized = std::abs(path.lateral_offset) / config_.max_lateral_offset;
+    lateral_cost_normalized = std::min(1.0, lateral_cost_normalized);
     
-    // Curvature cost
-    double curvature_cost = 0.0;
+    // 2. 곡률 비용 (0-1 정규화)
+    double curvature_cost_normalized = 0.0;
+    double max_curvature_in_path = 0.0;
     for (const auto& point : path.points) {
-        curvature_cost += point.curvature * point.curvature;
+        max_curvature_in_path = std::max(max_curvature_in_path, std::abs(point.curvature));
     }
-    curvature_cost *= config_.curvature_cost_weight;
-    cost += curvature_cost;
+    curvature_cost_normalized = std::min(1.0, max_curvature_in_path / config_.max_curvature);
     
-    // Debug: Log cost breakdown for all paths with enhanced detail
-    static int cost_log_count = 0;
-    if (cost_log_count < 10 && (std::abs(path.lateral_offset) < 0.1 || std::abs(path.lateral_offset) > 0.3)) {
-        double lateral_cost = (std::abs(path.lateral_offset) < 0.05) ? 0.0 : std::pow(path.lateral_offset, 4) * config_.lateral_cost_weight;
-        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
-            "[COST DEBUG] lateral_offset=%.3f: lateral_cost=%.1f (%.3f^4 * %.1f), curvature_cost=%.1f, total=%.1f %s", 
-            path.lateral_offset, lateral_cost, path.lateral_offset, config_.lateral_cost_weight, curvature_cost, cost,
-            (std::abs(path.lateral_offset) < 0.05) ? "*** RACELINE ***" : "");
-        cost_log_count++;
-    }
-    
-    // Obstacle cost - only if obstacles exist
-    double obstacle_cost = 0.0;
+    // 3. 장애물 관련 비용 (정규화된 시스템)
+    double obstacle_cost_normalized = 0.0;
     if (!obstacles.empty()) {
+        double max_obstacle_cost = 0.0;
         for (const auto& point : path.points) {
             for (const auto& obstacle : obstacles) {
                 double dx = point.x - obstacle.x;
@@ -423,21 +412,36 @@ double PathGenerator::calculate_path_cost(
                 double distance = std::sqrt(dx*dx + dy*dy);
                 
                 if (distance < config_.obstacle_detection_range) {
-                    obstacle_cost += config_.obstacle_cost_weight / (distance + 0.1);
+                    double point_cost = 1.0 / (distance + 0.1);  // 거리 반비례
+                    max_obstacle_cost = std::max(max_obstacle_cost, point_cost);
                 }
             }
         }
+        // 정규화: 최대 예상 비용 10.0으로 나누어 0-1 범위로 변환
+        obstacle_cost_normalized = std::min(1.0, max_obstacle_cost / 10.0);
     }
-    cost += obstacle_cost;
     
-    // Velocity cost (prefer maintaining speed)
-    double velocity_cost = 0.0;
-    for (const auto& point : path.points) {
-        double vel_diff = point.velocity - config_.max_velocity * 0.8;  // Prefer 80% of max velocity
-        velocity_cost += vel_diff * vel_diff;
+    // === 가중치 합을 통한 최종 비용 계산 ===
+    double cost = 
+        lateral_cost_normalized * config_.lateral_cost_weight +
+        curvature_cost_normalized * config_.curvature_cost_weight +
+        obstacle_cost_normalized * config_.obstacle_cost_weight;
+    
+    // 레이스라인 보너스 (기존 로직 유지)
+    if (std::abs(path.lateral_offset) < 0.05) {
+        cost *= 0.8;  // 20% 보너스
     }
-    velocity_cost *= config_.longitudinal_cost_weight * 0.01;
-    cost += velocity_cost;
+    
+    // Debug: 정규화된 비용 시스템 로깅
+    static int cost_log_count = 0;
+    if (cost_log_count < 5) {
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+            "[NORMALIZED COST] offset=%.3f: lateral=%.3f, curvature=%.3f, obstacle=%.3f, final=%.3f %s", 
+            path.lateral_offset, lateral_cost_normalized, curvature_cost_normalized, 
+            obstacle_cost_normalized, cost,
+            (std::abs(path.lateral_offset) < 0.05) ? "*** RACELINE ***" : "");
+        cost_log_count++;
+    }
     
     return cost;
 }

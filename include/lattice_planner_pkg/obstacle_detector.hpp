@@ -24,7 +24,8 @@ struct ObstacleDetectionConfig {
     double forward_distance_max = 6.0;
     double lateral_distance_max = 3.0;
     int occupancy_threshold = 50;
-    double occupancy_inflation_radius = 0.3;
+    double occupancy_inflation_radius = 0.4;
+    double proximity_search_radius = 3.0;  // 근접 비용 계산 범위 (m)
     bool unknown_is_obstacle = false;
 };
 
@@ -49,6 +50,14 @@ public:
     
     // 경로 비용 계산
     double calculateOccupancyCost(const std::vector<geometry_msgs::msg::Point>& path_points) const;
+    
+    // 정규화된 비용 계산 (장애물 존재, 미지 영역, 거리 기반)
+    struct NormalizedCosts {
+        double obstacle_existence;  // 0-1 정규화된 장애물 존재 비용
+        double unknown_area;       // 0-1 정규화된 미지 영역 비용  
+        double obstacle_distance;  // 0-1 정규화된 장애물 거리 비용
+    };
+    NormalizedCosts calculateNormalizedCosts(const std::vector<geometry_msgs::msg::Point>& path_points) const;
     
     // 경로 충돌 검사
     bool pathCollidesWithLidar(const std::vector<geometry_msgs::msg::Point>& path_points) const;

@@ -33,6 +33,13 @@ public:
     
     // Cluster nearby obstacles
     std::vector<Obstacle> cluster_obstacles(const std::vector<Obstacle>& obstacles);
+    
+    // Check if grid cell is occupied
+    bool is_cell_occupied(const nav_msgs::msg::OccupancyGrid& grid, int x, int y);
+    
+    // World coordinates to grid coordinates
+    bool world_to_grid(const nav_msgs::msg::OccupancyGrid& grid, 
+                      const Point2D& world_point, int& x, int& y);
 
 private:
     PlannerConfig config_;
@@ -44,15 +51,8 @@ private:
         double vehicle_yaw
     );
     
-    // Check if grid cell is occupied
-    bool is_cell_occupied(const nav_msgs::msg::OccupancyGrid& grid, int x, int y);
-    
     // Grid coordinates to world coordinates
     Point2D grid_to_world(const nav_msgs::msg::OccupancyGrid& grid, int x, int y);
-    
-    // World coordinates to grid coordinates
-    bool world_to_grid(const nav_msgs::msg::OccupancyGrid& grid, 
-                      const Point2D& world_point, int& x, int& y);
 };
 
 } // namespace lattice_planner_pkg

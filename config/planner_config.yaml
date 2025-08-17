@@ -5,18 +5,18 @@ lattice_planner:
     # Reference path (relative to package)
     # reference_path_file: "slam_map_global"  # Will be resolved to package/config/reference_paths/
     # reference_path_file: "Spielberg_global"
-    reference_path_file: "slam_cent"
+    reference_path_file: "Spielberg_global"
     path_resolution: 0.1
     
     # Planning parameters
     lateral_step: 0.3           # Lateral sampling step (m) - reduced for more precise lattice
     max_lateral_offset: 1.5     # Maximum lateral offset (m) - reduced to stay within track
-    planning_horizon: 1.5       # Planning time horizon (s) - further reduced for faster corner response
+    planning_horizon: 2.0       # Planning time horizon (s)
     dt: 0.1                     # Time step (s) - reduced for smoother paths and faster updates
     planning_frequency: 30.0    # Planning frequency (Hz) - further increased for reactive corner handling
     
     # Vehicle parameters
-    max_velocity: 10.0          # Maximum velocity (m/s)
+    max_velocity: 5.0          # Maximum velocity (m/s)
     wheelbase: 0.33             # Vehicle wheelbase (m)
     max_curvature: 1.0          # Maximum path curvature (1/m)
     
