@@ -69,18 +69,27 @@ CandidateResult* PathSelector::selectOptimalPath(
             chosen = primary;
         }
     } else {
-        // 정상 선택 로직
-        if (!has_obstacles) {
-            if (!detour_state_.detour_active) {
-                // 원래부터 중앙선
-                if (reference_candidate && !reference_candidate->collided && !reference_candidate->out_of_track) {
-                    chosen = reference_candidate;
+        // 정상 선택 로직 - raceline 우선순위 강화
+        if (!actual_obstacle_situation) {  // 안전한 경로가 있는 상황
+            // raceline이 안전하면 무조건 선택 (detour 상태 무관)
+            if (reference_candidate && !reference_candidate->collided && !reference_candidate->out_of_track) {
+                chosen = reference_candidate;
+                // detour에서 복귀 시 커밋 초기화
+                if (detour_state_.detour_active) {
+                    commit_state_.has_commit = false;
+                    RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
+                        "[RACELINE RETURN] Returning to raceline, clearing commit");
                 }
+            } else if (!detour_state_.detour_active) {
+                // raceline이 없고 detour도 아닌 경우 primary 선택
+                chosen = primary;
             } else {
-                // Detour에서 복귀 가능한 상황
+                // Detour에서 복귀 가능한 상황 체크
                 if (canReturnFromDetour(reference_candidate)) {
                     chosen = reference_candidate;
                     commit_state_.has_commit = false; // 복귀 시 커밋 초기화
+                    RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
+                        "[DETOUR RETURN] Conditions met, returning to raceline");
                 } else {
                     // 아직 복귀 조건 미충족
                     if (commit_state_.has_commit && committed_in_set && 
@@ -126,23 +135,47 @@ CandidateResult* PathSelector::selectOptimalPath(
                 "🚨🚨🚨 [SAFETY OVERRIDE] REJECTING DANGEROUS PATH: offset=%.3f, collided=%s, out_of_track=%s", 
                 chosen->d_offset, chosen->collided ? "true" : "false", chosen->out_of_track ? "true" : "false");
             
-            // 안전한 대안 찾기
+            // 안전한 대안 찾기 - 비용 기준으로 최적 선택
             CandidateResult* safe_alternative = nullptr;
+            double best_safe_cost = std::numeric_limits<double>::max();
+            
             for (auto& c : candidates) {
                 if (!c.collided && !c.out_of_track) {
-                    safe_alternative = &c;
-                    break;  // 첫 번째 안전한 경로 선택
+                    if (c.cost < best_safe_cost) {
+                        best_safe_cost = c.cost;
+                        safe_alternative = &c;
+                    }
                 }
             }
             
             if (safe_alternative) {
                 RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
-                    "🛡️ [SAFETY RECOVERY] Using safe alternative: offset=%.3f", safe_alternative->d_offset);
+                    "🛡️ [SAFETY RECOVERY] Using BEST safe alternative: offset=%.3f, cost=%.3f", 
+                    safe_alternative->d_offset, safe_alternative->cost);
                 chosen = safe_alternative;
             } else {
+                // 마지막 수단: 최소 비용 경로 (out_of_track이라도)
                 RCLCPP_FATAL(rclcpp::get_logger("path_selector"), 
-                    "💀 [CRITICAL] NO SAFE PATHS AVAILABLE - EMERGENCY STOP RECOMMENDED");
-                return nullptr;  // 안전한 경로가 없으면 null 반환
+                    "💀 [EMERGENCY] NO COMPLETELY SAFE PATHS! Using minimum cost path as last resort");
+                
+                CandidateResult* min_cost_path = nullptr;
+                double absolute_min_cost = std::numeric_limits<double>::max();
+                
+                for (auto& c : candidates) {
+                    if (c.cost < absolute_min_cost) {
+                        absolute_min_cost = c.cost;
+                        min_cost_path = &c;
+                    }
+                }
+                
+                if (min_cost_path) {
+                    RCLCPP_ERROR(rclcpp::get_logger("path_selector"), 
+                        "🆘 [LAST RESORT] Using minimum cost path: offset=%.3f, cost=%.3f", 
+                        min_cost_path->d_offset, min_cost_path->cost);
+                    chosen = min_cost_path;
+                } else {
+                    return nullptr;  // 정말 아무것도 없으면 null
+                }
             }
         }
         
@@ -278,19 +311,63 @@ CandidateResult* PathSelector::selectPrimaryPath(std::vector<CandidateResult>& c
         
         return (it != candidates.end() ? &*it : nullptr);
     } else {
-        // 장애물이 없을 때: raceline 우선, 없으면 cost 기반 선택
+        // 장애물이 없을 때: raceline 최우선, 적극적 복귀
+        RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+            "[NO OBSTACLES] Looking for raceline to return to optimal path");
+        
+        // 1. 안전한 raceline이 있으면 무조건 선택
+        if (safe_raceline) {
+            RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
+                "[RACELINE PRIORITY] Safe raceline available, forcing return! cost=%.3f", safe_raceline->cost);
+            return safe_raceline;
+        }
+        
+        // 2. 약간 벗어나도 raceline에 가까운 안전한 경로 찾기
+        CandidateResult* near_raceline = nullptr;
+        double min_raceline_distance = std::numeric_limits<double>::max();
+        
+        for (auto& c : candidates) {
+            if (!c.collided && !c.out_of_track) {
+                double distance_to_raceline = std::abs(c.d_offset);
+                if (distance_to_raceline < min_raceline_distance) {
+                    min_raceline_distance = distance_to_raceline;
+                    near_raceline = &c;
+                }
+            }
+        }
+        
+        if (near_raceline && min_raceline_distance < 0.3) {  // 30cm 이내
+            RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
+                "[NEAR RACELINE] Selecting path close to raceline: offset=%.3f, cost=%.3f", 
+                near_raceline->d_offset, near_raceline->cost);
+            return near_raceline;
+        }
+        
+        // 3. 일반적인 raceline (충돌 가능성 있어도 고려)
         if (raceline_candidate) {
-            RCLCPP_INFO(rclcpp::get_logger("path_selector"), "[RACELINE RECOVERY] No obstacles, using raceline, cost=%.3f", raceline_candidate->cost);
+            RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+                "[RACELINE FALLBACK] Using raceline despite potential issues, cost=%.3f", raceline_candidate->cost);
             return raceline_candidate;
         }
         
+        // 4. 마지막 수단: 안전한 경로 중 최소 cost
         auto it = std::min_element(candidates.begin(), candidates.end(),
             [](const auto& a, const auto& b) {
                 // out_of_track / collided 우선 제외
                 bool a_bad = a.collided || a.out_of_track;
                 bool b_bad = b.collided || b.out_of_track;
                 if (a_bad != b_bad) return !a_bad; // 좋은 것이 우선
-                return a.cost < b.cost; // cost 기반 선택
+                
+                // 안전한 경로들 중에서는 raceline에 가까운 것 우선
+                if (!a_bad && !b_bad) {
+                    double a_dist = std::abs(a.d_offset);
+                    double b_dist = std::abs(b.d_offset);
+                    if (std::abs(a_dist - b_dist) > 0.1) {
+                        return a_dist < b_dist;  // raceline에 더 가까운 것
+                    }
+                }
+                
+                return a.cost < b.cost; // cost 기준 선택
             });
         
         return (it != candidates.end() ? &*it : nullptr);
@@ -321,8 +398,16 @@ bool PathSelector::shouldAllowSwitch(
     }
     
     if (config_.path_length_commit_mode) {
-        // 경로 길이 기반 커밋: 장애물 상황에서 더 보수적인 해제
+        // 경로 길이 기반 커밋: raceline 복귀 우선순위 강화
         bool basic_length_reached = (current_s >= commit_state_.committed_path_end_s);
+        
+        // 🎯 RACELINE 복귀 특별 조건: 장애물이 없고 raceline이 안전하면 즉시 복귀 허용
+        if (!has_obstacles && primary_path && std::abs(primary_path->d_offset) < 0.1 && 
+            !primary_path->collided && !primary_path->out_of_track) {
+            RCLCPP_WARN(rclcpp::get_logger("path_selector"), 
+                "[RACELINE OVERRIDE] Safe raceline available - allowing immediate return despite commit!");
+            return true;
+        }
         
         // 장애물 상황에서 커밋된 경우, 추가 안전 조건 확인
         if (commit_state_.committed_during_obstacle) {

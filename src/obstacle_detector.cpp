@@ -99,7 +99,7 @@ bool ObstacleDetector::hasOccupancyObstacles(double ego_x, double ego_y) const {
     if (grid.info.resolution <= 0 || grid.info.width == 0 || grid.info.height == 0) return false;
     
     // 차량 주변 일정 범위에서 장애물 검사
-    double search_radius = 8.0; // 8m 범위
+    double search_radius = 5.0; // 8m 범위
     double res = grid.info.resolution;
     int w = (int)grid.info.width;
     int h = (int)grid.info.height;
@@ -204,11 +204,19 @@ double ObstacleDetector::calculateOccupancyCost(const std::vector<geometry_msgs:
 bool ObstacleDetector::pathCollidesWithLidar(const std::vector<geometry_msgs::msg::Point>& path_points) const {
     if (detected_obstacles_.empty()) return false;
     
+    // 차량/장애물 반경 및 여유 거리 설정 (간단 상수, 추후 파라미터화 가능)
+    constexpr double kVehicleRadius = 0.18;      // F1TENTH 대략 반경 (차폭~0.31m 기준)
+    constexpr double kMinObstacleRadius = 0.05;  // 최소 장애물 반경 가정 (아주 작은 물체 보호)
+    constexpr double kSafetyMargin = 0.07;       // 추가 여유 거리
+
     for (const auto &p : path_points) {
         for (const auto &obs : detected_obstacles_) {
             double dx = p.x - obs.x;
             double dy = p.y - obs.y;
-            if (dx*dx + dy*dy < 0.16) { // 0.4m 충돌 반경
+            // 장애물의 대략적 반경(클러스터 size의 절반)과 차량 반경, 여유를 합산해 충돌 반경 구성
+            double obs_radius = std::max(kMinObstacleRadius, obs.size * 0.5);
+            double collide_r = kVehicleRadius + obs_radius + kSafetyMargin;
+            if (dx*dx + dy*dy < collide_r * collide_r) {
                 return true;
             }
         }

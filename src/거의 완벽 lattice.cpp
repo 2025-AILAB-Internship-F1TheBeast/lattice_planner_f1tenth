@@ -7,87 +7,13 @@
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <algorithm>
 
-// Local helpers for inflated occupancy checks used by planner and visualization
-namespace {
-// Inline occupancy inflation radius (meters) used by simple grid checks in planner/viz
-// Set from ROS parameter in initialize(); default 0.25 m for reasonable safety
-static double g_inline_inflation_radius = 0.25;
-// Occupancy threshold for collision detection (lower = more safe)
-static int g_occupancy_threshold = 60;
-
-// SIMPLIFIED AND EFFECTIVE collision detection
-inline bool isOccupiedInflated(const nav_msgs::msg::OccupancyGrid &grid,
-                               double x, double y,
-                               double inflation_radius_m,
-                               int occupancy_threshold = 50,
-                               bool treat_unknown_as_occupied = false,
-                               bool debug_log = false) {
-    const int w = static_cast<int>(grid.info.width);
-    const int h = static_cast<int>(grid.info.height);
-    const double res = grid.info.resolution;
-    const double ox = grid.info.origin.position.x;
-    const double oy = grid.info.origin.position.y;
-
-    // Map coords of the query point
-    const int mx = static_cast<int>(std::floor((x - ox) / res));
-    const int my = static_cast<int>(std::floor((y - oy) / res));
-    
-    // 맵 경계 밖: 시각화/간이 체크에서는 '충돌'이 아니라 '트랙 이탈'로 취급하고 여기서는 충돌로 보지 않음
-    // (create_path_markers에서 별도 out_of_track 처리함)
-    if (mx < 0 || my < 0 || mx >= w || my >= h) {
-        return false;
-    }
-
-    // Check center cell first (가장 중요)
-    const int center_idx = my * w + mx;
-    if (center_idx >= 0 && center_idx < static_cast<int>(grid.data.size())) {
-        const int8_t center_val = grid.data[center_idx];
-        if (center_val >= occupancy_threshold) {
-            return true;  // 중심이 막혀있으면 충돌
-        }
-        if (center_val < 0 && treat_unknown_as_occupied) {
-            return true;  // unknown도 위험
-        }
-    }
-
-    // Simplified inflation check - just 4 directions + corners
-    const int r_cells = std::max(1, static_cast<int>(std::ceil(inflation_radius_m / res)));
-    
-    // Check key surrounding cells (8방향)
-    for (int dy = -r_cells; dy <= r_cells; dy += r_cells) {
-        for (int dx = -r_cells; dx <= r_cells; dx += r_cells) {
-            if (dx == 0 && dy == 0) continue;  // already checked center
-            
-            const int nx = mx + dx;
-            const int ny = my + dy;
-            // 경계 밖 셀은 충돌 판단에서 제외 (시각화 과도한 빨간색 방지)
-            if (nx < 0 || ny < 0 || nx >= w || ny >= h) {
-                continue;
-            }
-            
-            const int idx = ny * w + nx;
-            if (idx >= 0 && idx < static_cast<int>(grid.data.size())) {
-                const int8_t v = grid.data[idx];
-                if (v >= occupancy_threshold) return true;
-                if (v < 0 && treat_unknown_as_occupied) return true;
-            }
-        }
-    }
-    
-    return false;
-}
-} // namespace
-
 namespace lattice_planner_pkg {
 
 LatticePlanner::LatticePlanner() 
     : Node("lattice_planner"),
       vehicle_yaw_(0.0),
       vehicle_velocity_(0.0),
-      odom_received_(false),
-      has_committed_path_(false),
-      commit_duration_safe_(1.0),
-      commit_duration_danger_(0.3) {
+      odom_received_(false) {
     
     if (!initialize()) {
         RCLCPP_ERROR(this->get_logger(), "Failed to initialize lattice planner");
@@ -139,18 +65,6 @@ bool LatticePlanner::initialize() {
     config_.obstacle_existence_weight = this->get_parameter("obstacle_existence_weight").as_double();
     config_.unknown_area_weight = this->get_parameter("unknown_area_weight").as_double();
     config_.obstacle_distance_weight = this->get_parameter("obstacle_distance_weight").as_double();
-
-    // Inline occupancy inflation radius for simple grid checks (viz/selection)
-    this->declare_parameter("inline_occupancy_inflation_radius", 0.25);
-    g_inline_inflation_radius = this->get_parameter("inline_occupancy_inflation_radius").as_double();
-    
-    // Occupancy threshold for collision detection  
-    this->declare_parameter("occupancy_threshold", 60);
-    g_occupancy_threshold = this->get_parameter("occupancy_threshold").as_int();
-    
-    RCLCPP_INFO(this->get_logger(), "=== 충돌 감지 설정 (벽 박기 방지) ===");
-    RCLCPP_INFO(this->get_logger(), "Inflation radius: %.3f m (벽 두께)", g_inline_inflation_radius);
-    RCLCPP_INFO(this->get_logger(), "Occupancy threshold: %d (낮을수록 안전)", g_occupancy_threshold);
     
     double planning_frequency = this->get_parameter("planning_frequency").as_double();
     std::string occupancy_grid_topic = this->get_parameter("occupancy_grid_topic").as_string();
@@ -174,10 +88,10 @@ bool LatticePlanner::initialize() {
     // Initialize enhanced LiDAR obstacle detector
     advanced::ObstacleDetectionConfig obs_config;
     // 기본 감지 설정 - 향상된 범위
-    obs_config.max_detection_range = 6.0;         // 더 넓은 감지 범위
+    obs_config.max_detection_range = 8.0;         // 더 넓은 감지 범위
     obs_config.lateral_range = M_PI / 2.0;        // 180도 시야각
-    obs_config.forward_distance_max = 4.0;       // 전방 6m
-    obs_config.lateral_distance_max = 2.0;       // 좌우 3m
+    obs_config.forward_distance_max = 6.0;       // 전방 6m
+    obs_config.lateral_distance_max = 3.0;       // 좌우 3m
     
     // 라이다 전처리 설정
     obs_config.min_range_threshold = 0.1;        // 최소 거리
@@ -197,10 +111,9 @@ bool LatticePlanner::initialize() {
     obs_config.velocity_estimation_window = 0.5; // 속도 추정 윈도우
     obs_config.min_dynamic_velocity = 0.3;       // 동적 판정 속도
     
-    // Occupancy grid 설정 - 더 현실적인 값으로 조정
-    obs_config.occupancy_threshold = g_occupancy_threshold;         // 통일된 임계값 사용 (60)
-    // Use the same inflation radius as inline checks for consistency  
-    obs_config.occupancy_inflation_radius = g_inline_inflation_radius; // 팽창 반경 (0.25m)
+    // Occupancy grid 설정
+    obs_config.occupancy_threshold = 40;         // 임계값 완화
+    obs_config.occupancy_inflation_radius = 0.3; // 팽창 반경
     obs_config.proximity_search_radius = 3.5;    // 근접 탐지 범위
     obs_config.unknown_is_obstacle = false;      // 미지 영역은 장애물 아님
     
@@ -212,12 +125,12 @@ bool LatticePlanner::initialize() {
     sel_config.commit_min_time_sec = 0.8;
     
     // 장애물 회피 지속성 강화
-    sel_config.path_length = 2.0;                       // 기본 커밋 길이 증가
+    sel_config.path_length = 4.0;                       // 기본 커밋 길이 증가
     sel_config.obstacle_path_length_multiplier = 1.5;   // 장애물 상황에서 1.5배 연장
     sel_config.path_length_commit_mode = true;          // 경로 길이 기반 커밋 활성화
     
     // 더 안정적인 detour 설정
-    sel_config.detour_return_clear_frames_threshold = 5; // 더 많은 프레임 확인 후 복귀
+    sel_config.detour_return_clear_frames_threshold = 8; // 더 많은 프레임 확인 후 복귀
     sel_config.reference_offset_tolerance = 0.05;       // raceline 허용 범위 약간 확대
     
     path_selector_ = std::make_unique<advanced::PathSelector>(sel_config);
@@ -412,21 +325,7 @@ void LatticePlanner::grid_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr
 
 void LatticePlanner::planning_timer_callback() {
     if (!odom_received_) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
-            "Waiting for odometry data...");
         return; // Skip planning until odometry is available
-    }
-    
-    // Validate vehicle position before planning
-    {
-        std::lock_guard<std::mutex> state_lock(vehicle_state_mutex_);
-        if (std::isnan(vehicle_position_.x) || std::isnan(vehicle_position_.y) || 
-            std::abs(vehicle_position_.x) > 1000.0 || std::abs(vehicle_position_.y) > 1000.0) {
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "Invalid vehicle position: (%.3f, %.3f) - skipping planning", 
-                vehicle_position_.x, vehicle_position_.y);
-            return;
-        }
     }
     
     plan_paths();
@@ -460,8 +359,8 @@ void LatticePlanner::plan_paths() {
     }
     
     
-    // Select best path with adaptive commit logic
-    PathCandidate selected_path = select_best_path_adaptive(candidates);
+    // Select best path
+    PathCandidate selected_path = select_best_path(candidates);
     
     // Publish selected path
     publish_selected_path(selected_path);
@@ -474,26 +373,6 @@ void LatticePlanner::plan_paths() {
     
     // Publish visualization
     publish_path_visualization(candidates, selected_path);
-}
-
-PathCandidate LatticePlanner::select_best_path_adaptive(const std::vector<PathCandidate>& candidates) {
-    // First check if we should stick to the committed path
-    if (should_keep_committed_path(candidates)) {
-        return committed_path_;
-    }
-    
-    // Otherwise, select new path
-    PathCandidate new_path = select_best_path(candidates);
-    
-    // Update committed path if it's safe enough to commit
-    if (is_safe_to_commit(new_path, candidates)) {
-        committed_path_ = new_path;
-        commit_time_ = this->get_clock()->now();
-    has_committed_path_ = true;
-        RCLCPP_INFO(this->get_logger(), "[COMMIT] New path committed with offset %.3f", new_path.lateral_offset);
-    }
-    
-    return new_path;
 }
 
 PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>& candidates) {
@@ -576,7 +455,7 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
                            i, candidate.lateral_offset);
             }
 
-            // REAL OBSTACLE/WALL DETECTION: 실제 occupancy grid 기반
+            // OUT-OF-TRACK FILTER: 전체 경로에 대해 트랙 이탈 검사
             {
                 std::lock_guard<std::mutex> grid_lock(grid_mutex_);
                 if (current_grid_) {
@@ -586,86 +465,56 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
                     double res = grid.info.resolution;
                     double ox = grid.info.origin.position.x;
                     double oy = grid.info.origin.position.y;
+                    bool oob = false;
+                    bool occupied_collision = false;
                     
-                    bool has_collision = false;
-                    int collision_count = 0;
-                    
-                    // 경로의 상당 부분을 체크 (더 정확한 판단)
-                    int check_points = std::min(static_cast<int>(full_path.size()), 
-                                               std::max(15, static_cast<int>(full_path.size() * 0.6)));
-                    
-                    for (int j = 0; j < check_points; ++j) {
-                        const auto &p = full_path[j];
-                        
-                        // 1. 맵 경계 체크 (더 관대하게)
+                    for (const auto &p : full_path) {
                         int mx = static_cast<int>(std::floor((p.x - ox) / res));
                         int my = static_cast<int>(std::floor((p.y - oy) / res));
-                        
-                        // Only mark out_of_track if really outside map bounds
                         if (mx < 0 || my < 0 || mx >= w || my >= h) { 
-                            result.out_of_track = true;
-                            break;  // Don't break collision detection, just mark out_of_track
+                            oob = true; 
+                            break; 
                         }
-                        
-                        // Skip further checks for this point if out of bounds
-                        if (mx < 0 || my < 0 || mx >= w || my >= h) {
-                            continue;
-                        }
-                        
-                        // 2. 실제 occupancy 값 체크 - 매우 단순하고 확실한 방법
                         int idx = my * w + mx;
-                        if (idx >= 0 && idx < static_cast<int>(grid.data.size())) {
-                            int8_t cell_value = grid.data[idx];
-                            
-                            // 확실한 장애물만 감지 (매우 높은 확률만)
-                            if (cell_value > 95) {
-                                result.collided = true;
-                                has_collision = true;
-                                collision_count++;
-                            }
+                        if (idx < 0 || idx >= static_cast<int>(grid.data.size())) { 
+                            oob = true; 
+                            break; 
                         }
-                        
-                        if (collision_count >= 2) break;  // 2개 이상 충돌하면 확실히 위험
+                        int8_t v = grid.data[idx];
+                        if (v >= 50) { // 점유 임계치
+                            occupied_collision = true;
+                            break;
+                        }
                     }
                     
-                    // 페널티 적용
-                    if (result.out_of_track) {
-                        base_obstacle_cost += 500.0;
-                    }
-                    if (result.collided) {
-                        base_obstacle_cost += 1000.0 + (collision_count * 200.0);
+                    if (oob) {
+                        result.out_of_track = true;
+                        base_obstacle_cost += 200.0; // 트랙 이탈은 매우 높은 페널티
+                        RCLCPP_WARN(this->get_logger(), "[OUT OF TRACK] Path %zu (offset=%.3f) goes out of bounds", 
+                                   i, candidate.lateral_offset);
                     }
                     
-                    // 로깅
-                    if (i < 3) {  // 처음 3개 경로만
-                        RCLCPP_ERROR(this->get_logger(), 
-                            "[PATH %zu] offset=%.3f, collision_count=%d, out_of_track=%s, collided=%s", 
-                            i, candidate.lateral_offset, collision_count,
-                            result.out_of_track ? "YES" : "NO", 
-                            result.collided ? "YES" : "NO");
+                    if (occupied_collision) {
+                        result.collided = true;
+                        base_obstacle_cost += 300.0; // 점유 구역 충돌은 매우 높은 페널티
                     }
-                } else {
-                    // No occupancy grid available - mark as safe for now but log warning
-                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
-                        "No occupancy grid data - collision detection disabled");
-                    // Don't mark as out_of_track or collided when no grid data
                 }
             }
             
             // 충돌 시에만 페널티 적용 (미래 예측 제거로 현재 안전 경로 보호)
-            if (immediate_collision || full_path_collision) {
+            if (direct_collision) {
                 base_obstacle_cost += 100.0;  // 실제 충돌에만 큰 페널티
-                RCLCPP_ERROR(this->get_logger(), "[COLLISION DETECTED] Path %zu (offset=%.3f) has collision!", 
+                RCLCPP_ERROR(this->get_logger(), "[IMMEDIATE COLLISION] Path %zu (offset=%.3f) has REAL collision NOW!", 
                            i, candidate.lateral_offset);
             }
             
             result.cost += base_obstacle_cost;
-            result.collided = result.collided || immediate_collision || full_path_collision;
+            result.collided = result.collided || direct_collision;
             
             // 상세 로깅 (미래 예측 제거)
             RCLCPP_INFO(this->get_logger(), "[IMMEDIATE CHECK] Path %zu: offset=%.3f, collision=%s, out_of_track=%s, cost=%.3f", 
                        i, candidate.lateral_offset, 
-                       (immediate_collision || full_path_collision) ? "YES" : "NO",
+                       direct_collision ? "YES" : "NO",
                        result.out_of_track ? "YES" : "NO",
                        base_obstacle_cost);
         }
@@ -678,18 +527,18 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
     size_t best_idx = 0;
     bool found_safe_path = false;
     
-    // RCLCPP_WARN(this->get_logger(), "[PATH SELECTION] Starting with %zu candidates", candidates.size());
+    RCLCPP_WARN(this->get_logger(), "[PATH SELECTION] Starting with %zu candidates", candidates.size());
     
     // 1단계: 안전한 경로들만 필터링 (충돌/트랙 이탈 제외)
     std::vector<size_t> safe_indices;
     for (size_t i = 0; i < candidates.size(); ++i) {
         bool is_safe = candidates[i].is_safe && !advanced_candidates[i].collided && !advanced_candidates[i].out_of_track;
         
-        // RCLCPP_WARN(this->get_logger(), "[PATH %zu] offset=%.3f, cost=%.3f, safe=%s, collided=%s -> %s", 
-        //            i, candidates[i].lateral_offset, advanced_candidates[i].cost, 
-        //            candidates[i].is_safe ? "YES" : "NO", 
-        //            advanced_candidates[i].collided ? "YES" : "NO",
-        //            is_safe ? "SAFE" : "UNSAFE");
+        RCLCPP_WARN(this->get_logger(), "[PATH %zu] offset=%.3f, cost=%.3f, safe=%s, collided=%s -> %s", 
+                   i, candidates[i].lateral_offset, advanced_candidates[i].cost, 
+                   candidates[i].is_safe ? "YES" : "NO", 
+                   advanced_candidates[i].collided ? "YES" : "NO",
+                   is_safe ? "SAFE" : "UNSAFE");
         
         if (is_safe) {
             safe_indices.push_back(i);
@@ -697,55 +546,17 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
     }
     
     if (safe_indices.empty()) {
-        RCLCPP_ERROR(this->get_logger(), "[EMERGENCY] No perfectly safe paths! Using smart fallback");
-        
-        // 🚨 SMART EMERGENCY: 충돌이 적은 경로부터 선택
-        
-        // 1단계: 트랙 내부이고 충돌이 적은 경로
-        std::vector<std::pair<size_t, int>> collision_scores;  // (index, collision_count)
-        
+        RCLCPP_ERROR(this->get_logger(), "[EMERGENCY] No safe paths found! Using cost-based fallback");
+        // 안전한 경로가 없으면 최소 비용 선택
         for (size_t i = 0; i < candidates.size(); ++i) {
-            if (!advanced_candidates[i].out_of_track) {
-                // 충돌 점수 계산 (낮을수록 좋음)
-                int score = 0;
-                if (advanced_candidates[i].collided) score += 10;
-                // 추가로 cost도 고려
-                score += static_cast<int>(advanced_candidates[i].cost / 100.0);
-                
-                collision_scores.push_back({i, score});
-            }
-        }
-        
-        if (!collision_scores.empty()) {
-            // 충돌 점수가 가장 낮은 것 선택
-            std::sort(collision_scores.begin(), collision_scores.end(), 
-                     [](const auto& a, const auto& b) { return a.second < b.second; });
-            
-            best_idx = collision_scores[0].first;
-            // RCLCPP_WARN(this->get_logger(), 
-            //     "[SMART FALLBACK] Selected least-collision path %zu (offset=%.3f, score=%d)", 
-            //     best_idx, candidates[best_idx].lateral_offset, collision_scores[0].second);
-            return candidates[best_idx];
-        }
-        
-        // 2단계: 모든 경로가 트랙 밖이면 raceline에 가장 가까운 것
-        RCLCPP_FATAL(this->get_logger(), "[CRITICAL] All paths out of track! Selecting closest to raceline");
-        
-        double min_abs_offset = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            double abs_offset = std::abs(candidates[i].lateral_offset);
-            if (abs_offset < min_abs_offset) {
-                min_abs_offset = abs_offset;
+            if (advanced_candidates[i].cost < min_cost) {
+                min_cost = advanced_candidates[i].cost;
                 best_idx = i;
+                found_safe_path = true;
             }
         }
-        
-        RCLCPP_ERROR(this->get_logger(), 
-            "[RACELINE FALLBACK] Selected closest to raceline %zu (offset=%.3f)", 
-            best_idx, candidates[best_idx].lateral_offset);
-        return candidates[best_idx];
     } else {
-        // RCLCPP_INFO(this->get_logger(), "[SAFE PATHS] Found %zu safe paths", safe_indices.size());
+        RCLCPP_INFO(this->get_logger(), "[SAFE PATHS] Found %zu safe paths", safe_indices.size());
         
     // 2단계: 안전한 경로들 중에서 레이스라인 즉시 복귀, 그 다음 최소 비용
         bool found_raceline = false;
@@ -756,7 +567,7 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
                 best_idx = idx;
                 found_safe_path = true;
                 found_raceline = true;
-                // RCLCPP_WARN(this->get_logger(), "[RACELINE SELECTED] Path %zu with offset %.3f", idx, candidates[idx].lateral_offset);
+                RCLCPP_WARN(this->get_logger(), "[RACELINE SELECTED] Path %zu with offset %.3f", idx, candidates[idx].lateral_offset);
                 break;
             }
         }
@@ -770,7 +581,7 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
                     found_safe_path = true;
                 }
             }
-            // RCLCPP_WARN(this->get_logger(), "[COST SELECTED] Path %zu with cost %.3f", best_idx, min_cost);
+            RCLCPP_WARN(this->get_logger(), "[COST SELECTED] Path %zu with cost %.3f", best_idx, min_cost);
         }
     }
     
@@ -795,15 +606,14 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
                 }
             }
             
-            RCLCPP_FATAL(this->get_logger(), "💀 [CRITICAL] NO SAFE PATHS FOUND! Using absolute emergency fallback");
-            // 절대 비상 모드: cost 무관하게 첫 번째 경로 사용
-            return candidates[0];
+            RCLCPP_FATAL(this->get_logger(), "💀 [CRITICAL] NO SAFE PATHS FOUND!");
+            return PathCandidate();  // 빈 경로 반환
         }
         
-        // RCLCPP_ERROR(this->get_logger(), 
-        //     "✅ [FINAL SELECTION] *** VERIFIED SAFE PATH %zu: offset=%.3f, cost=%.3f ***", 
-        //     best_idx, final_choice.lateral_offset, 
-        //     best_idx < advanced_candidates.size() ? advanced_candidates[best_idx].cost : -1.0);
+        RCLCPP_ERROR(this->get_logger(), 
+            "✅ [FINAL SELECTION] *** VERIFIED SAFE PATH %zu: offset=%.3f, cost=%.3f ***", 
+            best_idx, final_choice.lateral_offset, 
+            best_idx < advanced_candidates.size() ? advanced_candidates[best_idx].cost : -1.0);
         
         return final_choice;
     }
@@ -821,106 +631,6 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
     RCLCPP_WARN(this->get_logger(), "[EMERGENCY] Selected path %zu: lateral_offset=%.3f, cost=%.3f", 
                best_idx, candidates[best_idx].lateral_offset, min_cost);
     return candidates[best_idx];
-}
-
-bool LatticePlanner::should_keep_committed_path(const std::vector<PathCandidate>& candidates) {
-    if (!has_committed_path_) {
-        return false;
-    }
-    
-    // 1. 시간 기반 체크
-    auto now = this->get_clock()->now();
-    double elapsed = (now - commit_time_).seconds();
-    
-    // 2. 현재 상황이 위험한지 체크 (동적 장애물 등)
-    bool is_dangerous_situation = false;
-    
-    // Dynamic obstacles check
-    auto dynamic_obstacles = advanced_obstacle_detector_->getDynamicObstacles();
-    if (!dynamic_obstacles.empty()) {
-        is_dangerous_situation = true;
-    }
-    
-    // 3. Committed path가 여전히 안전한지 체크
-    bool committed_path_safe = is_path_still_safe(committed_path_);
-    
-    // 4. 결정 로직
-    double max_commit_time = is_dangerous_situation ? commit_duration_danger_ : commit_duration_safe_;
-    
-    if (!committed_path_safe) {
-        RCLCPP_WARN(this->get_logger(), "[COMMIT] Breaking commit - path no longer safe");
-        has_committed_path_ = false;
-        return false;
-    }
-    
-    if (elapsed > max_commit_time) {
-        RCLCPP_INFO(this->get_logger(), "[COMMIT] Breaking commit - time expired (%.3fs, max=%.3fs)", 
-                   elapsed, max_commit_time);
-        has_committed_path_ = false;
-        return false;
-    }
-    
-    RCLCPP_DEBUG(this->get_logger(), "[COMMIT] Keeping committed path (%.3fs remaining)", 
-                max_commit_time - elapsed);
-    return true;
-}
-
-bool LatticePlanner::is_safe_to_commit(const PathCandidate& path, const std::vector<PathCandidate>& candidates) {
-    // 1. 기본 안전성 체크
-    if (!path.is_safe) {
-        return false;
-    }
-    
-    // 2. 충돌 체크
-    std::vector<geometry_msgs::msg::Point> path_points;
-    for (const auto& point : path.points) {
-        geometry_msgs::msg::Point p;
-        p.x = point.x; p.y = point.y; p.z = 0.0;
-        path_points.push_back(p);
-    }
-    
-    if (advanced_obstacle_detector_->pathCollides(path_points)) {
-        return false;
-    }
-    
-    // 3. 동적 장애물이 있으면 더 보수적
-    auto dynamic_obstacles = advanced_obstacle_detector_->getDynamicObstacles();
-    if (!dynamic_obstacles.empty()) {
-        // 동적 상황에서는 raceline(offset=0) 근처만 commit
-        if (std::abs(path.lateral_offset) > 0.2) {
-            return false;
-        }
-    }
-    
-    return true;
-}
-
-bool LatticePlanner::is_path_still_safe(const PathCandidate& path) {
-    if (path.points.empty()) {
-        return false;
-    }
-    
-    // 경로 앞 부분만 체크 (1.5m)
-    std::vector<geometry_msgs::msg::Point> check_points;
-    double accum = 0.0;
-    
-    for (size_t i = 0; i < path.points.size(); ++i) {
-        geometry_msgs::msg::Point p;
-        p.x = path.points[i].x; 
-        p.y = path.points[i].y; 
-        p.z = 0.0;
-        check_points.push_back(p);
-        
-        if (i > 0) {
-            double dx = path.points[i].x - path.points[i-1].x;
-            double dy = path.points[i].y - path.points[i-1].y;
-            accum += std::sqrt(dx*dx + dy*dy);
-            if (accum > 1.5) break;  // 첫 1.5m만 체크
-        }
-    }
-    
-    // 충돌 체크
-    return !advanced_obstacle_detector_->pathCollides(check_points);
 }
 
 void LatticePlanner::publish_selected_path(const PathCandidate& path) {
@@ -959,65 +669,28 @@ void LatticePlanner::publish_selected_path(const PathCandidate& path) {
         trimmed.points.erase(trimmed.points.begin(), trimmed.points.begin() + static_cast<long>(start_idx));
     }
 
-    // 무조건 baselink에서 시작하도록 강제 설정
+    // Ensure the path always starts at the vehicle (base_link in map coords)
     {
         std::lock_guard<std::mutex> state_lock(vehicle_state_mutex_);
         if (!trimmed.points.empty()) {
-            // 기존 첫 번째 점 정보 저장
-            double orig_x = trimmed.points[0].x;
-            double orig_y = trimmed.points[0].y;
-            
-            // 기존 첫 번째 점을 baselink로 교체
-            CartesianPoint anchor;
-            anchor.x = vehicle_position_.x;
-            anchor.y = vehicle_position_.y; 
-            anchor.yaw = vehicle_yaw_;
-            anchor.velocity = std::max(0.0, vehicle_velocity_);
-            anchor.curvature = 0.0;
-            anchor.time = 0.0;
-            trimmed.points[0] = anchor;  // 첫 번째 점을 무조건 baselink로 설정
-            
-            // 시작점 디버깅 로그
-            RCLCPP_INFO(this->get_logger(), 
-                "[BASELINK START] Vehicle: (%.3f,%.3f) -> Path starts at: (%.3f,%.3f) | Original first: (%.3f,%.3f)", 
-                vehicle_position_.x, vehicle_position_.y,
-                trimmed.points[0].x, trimmed.points[0].y,
-                orig_x, orig_y);
-        }
-    }
-
-    // Near-term safety gate (first ~1.5m). If unsafe, we'll publish zero velocity to avoid wall crash.
-    bool near_collision = false;
-    {
-        std::vector<geometry_msgs::msg::Point> short_pts;
-        double accum = 0.0;
-        for (size_t i = 0; i < trimmed.points.size(); ++i) {
-            geometry_msgs::msg::Point p; p.x = trimmed.points[i].x; p.y = trimmed.points[i].y; p.z = 0.0;
-            short_pts.push_back(p);
-            if (i > 0) {
-                double dx = trimmed.points[i].x - trimmed.points[i-1].x;
-                double dy = trimmed.points[i].y - trimmed.points[i-1].y;
-                accum += std::sqrt(dx*dx + dy*dy);
-                if (accum > 1.5) break;
-            }
-        }
-        if (!short_pts.empty()) {
-            near_collision = advanced_obstacle_detector_->pathCollides(short_pts);
-            std::shared_ptr<nav_msgs::msg::OccupancyGrid> grid_copy;
-            {
-                std::lock_guard<std::mutex> grid_lock(grid_mutex_);
-                grid_copy = current_grid_;
-            }
-            if (grid_copy) {
-                for (const auto &p : short_pts) {
-                    if (isOccupiedInflated(*grid_copy, p.x, p.y, g_inline_inflation_radius, g_occupancy_threshold, false)) { near_collision = true; break; }
-                }
+            double dx0 = trimmed.points.front().x - vehicle_position_.x;
+            double dy0 = trimmed.points.front().y - vehicle_position_.y;
+            double d0 = std::sqrt(dx0*dx0 + dy0*dy0);
+            if (d0 > 0.05) { // avoid duplicating if already at vehicle
+                CartesianPoint anchor;
+                anchor.x = vehicle_position_.x;
+                anchor.y = vehicle_position_.y;
+                anchor.yaw = vehicle_yaw_;
+                anchor.velocity = std::max(0.0, vehicle_velocity_);
+                anchor.curvature = 0.0;
+                anchor.time = 0.0;
+                trimmed.points.insert(trimmed.points.begin(), anchor);
             }
         }
     }
 
-    // RCLCPP_ERROR(this->get_logger(), "[PUBLISH START] Publishing path with %zu points (trimmed from %zu), lateral_offset=%.3f", 
-    //             trimmed.points.size(), path.points.size(), path.lateral_offset);
+    RCLCPP_ERROR(this->get_logger(), "[PUBLISH START] Publishing path with %zu points (trimmed from %zu), lateral_offset=%.3f", 
+                trimmed.points.size(), path.points.size(), path.lateral_offset);
     
     // Publish path as nav_msgs::Path (for path_follower)
     auto nav_path = convert_to_nav_path(trimmed);
@@ -1025,37 +698,30 @@ void LatticePlanner::publish_selected_path(const PathCandidate& path) {
     
     // Publish path as PathWithVelocity (for velocity-aware control)
     auto velocity_path = convert_to_path_with_velocity(trimmed);
-    if (near_collision) {
-        for (auto &pt : velocity_path.points) {
-            pt.velocity = 0.0;
-        }
-        velocity_path.max_velocity = 0.0;
-        RCLCPP_WARN(this->get_logger(), "[SAFETY STOP] Near-term collision detected; forcing velocities to 0.0");
-    }
     path_with_velocity_pub_->publish(velocity_path);
     
     // 첫 번째와 마지막 점 로깅
     if (nav_path.poses.size() >= 2) {
         const auto& first = nav_path.poses.front();
         const auto& last = nav_path.poses.back();
-        // RCLCPP_ERROR(this->get_logger(), 
-        //     "[PUBLISH DETAILS] nav_path: %zu points, first=(%.2f,%.2f), last=(%.2f,%.2f)",
-        //     nav_path.poses.size(), 
-        //     first.pose.position.x, first.pose.position.y,
-        //     last.pose.position.x, last.pose.position.y);
+        RCLCPP_ERROR(this->get_logger(), 
+            "[PUBLISH DETAILS] nav_path: %zu points, first=(%.2f,%.2f), last=(%.2f,%.2f)",
+            nav_path.poses.size(), 
+            first.pose.position.x, first.pose.position.y,
+            last.pose.position.x, last.pose.position.y);
     }
     
     if (velocity_path.points.size() >= 2) {
         const auto& first_vel = velocity_path.points.front();
         const auto& last_vel = velocity_path.points.back();
-        // RCLCPP_ERROR(this->get_logger(), 
-        //     "[PUBLISH DETAILS] velocity_path: %zu points, first=(%.2f,%.2f,v=%.2f), last=(%.2f,%.2f,v=%.2f)",
-        //     velocity_path.points.size(), 
-        //     first_vel.x, first_vel.y, first_vel.velocity,
-        //     last_vel.x, last_vel.y, last_vel.velocity);
+        RCLCPP_ERROR(this->get_logger(), 
+            "[PUBLISH DETAILS] velocity_path: %zu points, first=(%.2f,%.2f,v=%.2f), last=(%.2f,%.2f,v=%.2f)",
+            velocity_path.points.size(), 
+            first_vel.x, first_vel.y, first_vel.velocity,
+            last_vel.x, last_vel.y, last_vel.velocity);
     }
     
-    // RCLCPP_ERROR(this->get_logger(), "[PUBLISH SUCCESS] Both topics published successfully!");
+    RCLCPP_ERROR(this->get_logger(), "[PUBLISH SUCCESS] Both topics published successfully!");
 }
 
 void LatticePlanner::publish_path_visualization(
@@ -1203,8 +869,8 @@ visualization_msgs::msg::MarkerArray LatticePlanner::create_path_markers(
                     if (mx < 0 || my < 0 || mx >= w || my >= h) { out_of_track = true; break; }
                     const int idx = my * w + mx;
                     if (idx < 0 || idx >= static_cast<int>(grid.data.size())) { out_of_track = true; break; }
-                    // Inflate occupancy by radius to thicken walls in viz too
-                    if (isOccupiedInflated(grid, p.x, p.y, g_inline_inflation_radius, g_occupancy_threshold, false)) { collided = true; break; }
+                    const int8_t v = grid.data[idx];
+                    if (v >= 50) { collided = true; break; } // occupied cell
                     // unknown(-1) is tolerated in viz to avoid false red
                 }
             }
@@ -1221,32 +887,14 @@ visualization_msgs::msg::MarkerArray LatticePlanner::create_path_markers(
         
         marker.scale.x = 0.05;  // Line width
         
-        // Check if this is the selected path (check by lateral offset match)
-        bool is_selected_path = (std::abs(candidates[i].lateral_offset - selected.lateral_offset) < 0.01);
-        
-        // Color coding:
-        // - Selected & safe: blue
-        // - Selected & unsafe: orange
-        // - Non-selected & safe: green
-        // - Non-selected & unsafe: red
-        if (is_selected_path && is_safe_now) {
-            marker.color.r = 0.0;
-            marker.color.g = 0.0;
-            marker.color.b = 1.0;
-            marker.color.a = 1.0;
-        } else if (is_selected_path && !is_safe_now) {
-            marker.color.r = 1.0;
-            marker.color.g = 0.5;
-            marker.color.b = 0.0;
-            marker.color.a = 1.0;
-        } else if (is_safe_now) {
-            // Safe paths are green
+        // Color coding based on real-time checks: green=safe, red=collided/track-out
+        if (is_safe_now) {
             marker.color.r = 0.0;
             marker.color.g = 1.0;
             marker.color.b = 0.0;
             marker.color.a = 0.7;
         } else {
-            // Unsafe paths are red (collision or out-of-track)
+            // Red for unsafe (collision or out-of-track)
             marker.color.r = 1.0;
             marker.color.g = 0.0;
             marker.color.b = 0.0;
@@ -1270,53 +918,11 @@ visualization_msgs::msg::MarkerArray LatticePlanner::create_path_markers(
         
         selected_marker.scale.x = 0.1;  // Thicker line
         
-        // Color selected overlay by short-segment safety (1.5m)
-        bool sel_collided = false;
-        bool sel_out = false;
-        if (!selected.points.empty()) {
-            std::vector<geometry_msgs::msg::Point> sel_short;
-            sel_short.reserve(selected.points.size());
-            double sel_accum = 0.0;
-            for (size_t i = 0; i < selected.points.size(); ++i) {
-                geometry_msgs::msg::Point p; p.x = selected.points[i].x; p.y = selected.points[i].y; p.z = 0.1;
-                if (!sel_short.empty()) {
-                    double dx = p.x - sel_short.back().x;
-                    double dy = p.y - sel_short.back().y;
-                    sel_accum += std::sqrt(dx*dx + dy*dy);
-                }
-                sel_short.push_back(p);
-                if (sel_accum > 1.5) break;
-            }
-            if (!sel_short.empty()) {
-                sel_collided = advanced_obstacle_detector_->pathCollides(sel_short);
-                std::shared_ptr<nav_msgs::msg::OccupancyGrid> grid_copy2;
-                {
-                    std::lock_guard<std::mutex> grid_lock(grid_mutex_);
-                    grid_copy2 = current_grid_;
-                }
-                if (grid_copy2) {
-                    const auto &grid = *grid_copy2;
-                    int w = (int)grid.info.width, h = (int)grid.info.height;
-                    double res = grid.info.resolution, ox = grid.info.origin.position.x, oy = grid.info.origin.position.y;
-                    for (const auto &p : sel_short) {
-                        int mx = (int)std::floor((p.x - ox)/res), my = (int)std::floor((p.y - oy)/res);
-                        if (mx < 0 || my < 0 || mx >= w || my >= h) { sel_out = true; break; }
-                        if (isOccupiedInflated(grid, p.x, p.y, g_inline_inflation_radius, g_occupancy_threshold, false)) { sel_collided = true; break; }
-                    }
-                }
-            }
-        }
-        if (!sel_collided && !sel_out) {
-            selected_marker.color.r = 0.0;
-            selected_marker.color.g = 0.0;
-            selected_marker.color.b = 1.0;
-            selected_marker.color.a = 1.0;
-        } else {
-            selected_marker.color.r = 1.0;
-            selected_marker.color.g = 0.5;
-            selected_marker.color.b = 0.0;
-            selected_marker.color.a = 1.0;
-        }
+        // Blue for selected path
+        selected_marker.color.r = 0.0;
+        selected_marker.color.g = 0.0;
+        selected_marker.color.b = 1.0;
+        selected_marker.color.a = 1.0;
         
         for (const auto& point : selected.points) {
             geometry_msgs::msg::Point p;

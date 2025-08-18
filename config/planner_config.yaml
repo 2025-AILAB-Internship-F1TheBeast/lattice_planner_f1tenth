@@ -5,15 +5,15 @@ lattice_planner:
     # Reference path (relative to package)
     # reference_path_file: "slam_map_global"  # Will be resolved to package/config/reference_paths/
     # reference_path_file: "Spielberg_global"
-    reference_path_file: "Spielberg_global"
+    reference_path_file: "slam_tool_box"
     path_resolution: 0.1
     
-    # Planning parameters
-    lateral_step: 0.3           # Lateral sampling step (m) - reduced for more precise lattice
-    max_lateral_offset: 1.5     # Maximum lateral offset (m) - reduced to stay within track
-    planning_horizon: 2.0       # Planning time horizon (s)
+    # Planning parameters (최적화: 샘플링 개수 감소)
+    lateral_step: 0.3           # Lateral sampling step (m) - 증가로 샘플 개수 감소
+    max_lateral_offset: 1.2     # Maximum lateral offset (m) - 감소로 범위 축소
+    planning_horizon: 1.0       # Planning time horizon (s)
     dt: 0.1                     # Time step (s) - reduced for smoother paths and faster updates
-    planning_frequency: 30.0    # Planning frequency (Hz) - further increased for reactive corner handling
+    planning_frequency: 40.0    # Planning frequency (Hz) - further increased for reactive corner handling
     
     # Vehicle parameters
     max_velocity: 5.0          # Maximum velocity (m/s)
@@ -22,7 +22,7 @@ lattice_planner:
     
     # Cost weights
     obstacle_cost_weight: 10.0
-    lateral_cost_weight: 800.0  # Maximum lateral cost weight for extreme raceline preference
+    lateral_cost_weight: 5.0  # Maximum lateral cost weight for extreme raceline preference
     curvature_cost_weight: 0.05  # Reduced to allow faster corner recovery
     longitudinal_cost_weight: 0.02  # Further reduced for speed prioritization
     
@@ -30,3 +30,10 @@ lattice_planner:
     safety_margin: 0.3          # Safety margin around obstacles (m)
     collision_radius: 0.5       # Vehicle collision radius (m)
     obstacle_detection_range: 8.0  # Obstacle detection range (m)
+    
+    # Occupancy grid settings - 확실한 벽만 감지 (false positive 방지)
+    inline_occupancy_inflation_radius: 0.25   # 벽에서 15cm만 (최소한의 안전거리)
+    occupancy_threshold: 90     # 매우 높은 threshold (확실한 벽만)
+    obstacle_existence_weight: 0.0
+    unknown_area_weight: 0.0
+    obstacle_distance_weight: 0.0

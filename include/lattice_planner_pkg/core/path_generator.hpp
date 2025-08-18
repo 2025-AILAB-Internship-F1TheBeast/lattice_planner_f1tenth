@@ -59,6 +59,9 @@ private:
         const std::vector<Obstacle>& obstacles
     );
     
+    // Check if lateral offset is within track bounds at given s position
+    bool is_within_track_bounds(double lateral_offset, double s_position) const;
+    
     // Generate time samples
     std::vector<double> generate_time_samples() const;
     

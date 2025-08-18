@@ -80,27 +80,90 @@ std::vector<PathCandidate> PathGenerator::generate_paths(
     // Generate lateral offset samples centered around vehicle's current position
     std::vector<double> lateral_samples = generate_lateral_samples(start_frenet.d);
     
-    // Generate velocity samples with current position info
-    std::vector<double> velocity_samples = generate_velocity_samples(vehicle_velocity, start_frenet.s);
-    
-    // Generate paths for each combination
+    // Filter out lateral samples that would result in out-of-track paths
+    std::vector<double> valid_lateral_samples;
     for (double lateral_offset : lateral_samples) {
-        for (double target_velocity : velocity_samples) {
-            PathCandidate candidate = generate_single_path(
-                start_frenet, lateral_offset, target_velocity);
+        if (is_within_track_bounds(lateral_offset, start_frenet.s)) {
+            valid_lateral_samples.push_back(lateral_offset);
+        }
+    }
+    
+    // Use valid samples, fallback to original if all are filtered out
+    if (!valid_lateral_samples.empty()) {
+        lateral_samples = valid_lateral_samples;
+    }
+    
+    // Disable speed sampling: use a single target velocity (clamped to limits)
+    double target_velocity = std::min(config_.max_velocity, std::max(2.5, vehicle_velocity));
+
+    // Generate paths for lateral samples only
+    static int generation_count = 0;
+    bool should_log = (generation_count < 5 || generation_count % 50 == 0);
+    
+    if (should_log) {
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+            "=== 경로 생성 시작 [%d]: %zu개 lateral samples ===", generation_count, lateral_samples.size());
+    }
+    
+    for (double lateral_offset : lateral_samples) {
+        PathCandidate candidate = generate_single_path(
+            start_frenet, lateral_offset, target_velocity);
+            
+        if (!candidate.points.empty()) {
+            // Set lateral offset BEFORE cost calculation
+            candidate.lateral_offset = lateral_offset;
+            
+            // Improved track bounds checking: only check start, middle, and end points to reduce computation
+            candidate.out_of_track = false;
+            std::vector<size_t> check_indices;
+            if (candidate.points.size() <= 3) {
+                // Small path, check all points
+                for (size_t i = 0; i < candidate.points.size(); ++i) {
+                    check_indices.push_back(i);
+                }
+            } else {
+                // Large path, check strategically: start, middle, end
+                check_indices.push_back(0);
+                check_indices.push_back(candidate.points.size() / 2);
+                check_indices.push_back(candidate.points.size() - 1);
+            }
+            
+            for (size_t idx : check_indices) {
+                const auto& point = candidate.points[idx];
+                // Convert cartesian point back to frenet to get s position
+                FrenetPoint frenet_point = frenet_coord_->cartesian_to_frenet(Point2D(point.x, point.y));
                 
-            if (!candidate.points.empty()) {
-                // Set lateral offset BEFORE cost calculation
-                candidate.lateral_offset = lateral_offset;
-                
-                // Calculate cost and check collision
-                candidate.cost = calculate_path_cost(candidate, obstacles);
-                candidate.is_safe = !check_collision(candidate, obstacles);
-                
-                candidates.push_back(candidate);
+                if (!is_within_track_bounds(frenet_point.d, frenet_point.s)) {
+                    candidate.out_of_track = true;
+                    if (should_log) {
+                        RCLCPP_WARN(rclcpp::get_logger("path_generator"), 
+                            "Path OUT_OF_TRACK: offset=%.3f at point %zu", lateral_offset, idx);
+                    }
+                    break;
+                }
+            }
+            
+            // Calculate cost and check collision for all paths (including out_of_track ones)
+            candidate.cost = calculate_path_cost(candidate, obstacles);
+            candidate.is_safe = !check_collision(candidate, obstacles);
+            
+            // Add all paths to candidates (let path selector decide what to do)
+            candidates.push_back(candidate);
+            
+            if (should_log) {
+                RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+                    "Path added: offset=%.3f, safe=%s, out_of_track=%s, cost=%.2f", 
+                    lateral_offset, candidate.is_safe ? "YES" : "NO",
+                    candidate.out_of_track ? "YES" : "NO", candidate.cost);
             }
         }
     }
+    
+    if (should_log) {
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+            "=== 경로 생성 완료 [%d]: %zu개 후보 경로 반환 ===", generation_count, candidates.size());
+    }
+    generation_count++;
     
     return candidates;
 }
@@ -116,19 +179,29 @@ PathCandidate PathGenerator::generate_single_path(
         return candidate;
     }
     
-    // Debug: Log path generation parameters
-    static int path_count = 0;
-    if (path_count < 10) {  // Only log first 10 paths to avoid spam
-        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
-            "[PATH %d] start_d=%.3f -> target_d=%.3f, start_s=%.3f, vel=%.3f", 
-            path_count++, start_frenet.d, target_lateral_offset, start_frenet.s, target_velocity);
-    }
-    
     // Generate time samples
     std::vector<double> time_samples = generate_time_samples();
     
-    // Use quintic polynomial for smooth lateral motion
+    // 평행한 경로 생성을 위한 새로운 접근법
     double T = config_.planning_horizon;
+    
+    // wheelbase + d_offset 크기에 따른 적응적 transition (더 부드러운 곡률)
+    double wheelbase_distance = 0.33;  // F1TENTH wheelbase 고정 거리
+    double abs_offset = std::abs(target_lateral_offset);
+    double base_transition_time = 0.4;  // 기본 전환 시간 증가 (0.3 -> 0.4)
+    double adaptive_transition_time = base_transition_time + abs_offset * 0.6;  // offset 영향 증가 (0.3 -> 0.6)
+    
+    double current_speed = std::max(2.0, start_frenet.s_dot);
+    double wheelbase_time = wheelbase_distance / current_speed;  // 정확히 0.33m에 해당하는 시간
+    
+    // Debug: Log adaptive wheelbase path generation
+    static int path_count = 0;
+    if (path_count < 10) {  // Only log first 10 paths to avoid spam
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+            "[WHEELBASE+ADAPTIVE PATH %d] d=%.3f->%.3f, wb=%.2fm(%.3fs), trans_time=%.3fs, speed=%.1fm/s", 
+            path_count++, start_frenet.d, target_lateral_offset, wheelbase_distance, wheelbase_time, 
+            adaptive_transition_time, current_speed);
+    }
     
     // Check reference path curvature ahead for adaptive planning
     RefPoint current_ref = frenet_coord_->get_reference_point(start_frenet.s);
@@ -150,48 +223,62 @@ PathCandidate PathGenerator::generate_single_path(
     // Apply conservative factor to lateral offset
     double adjusted_target_lateral_offset = target_lateral_offset * conservative_factor;
     
-    // Lateral motion parameters
-    double d_start = start_frenet.d;
-    double d_dot_start = start_frenet.d_dot;
-    double d_ddot_start = 0.0;  // Assume zero initial lateral acceleration
-    
-    double d_end = adjusted_target_lateral_offset;
-    double d_dot_end = 0.0;     // Target zero lateral velocity at end
-    double d_ddot_end = 0.0;    // Target zero lateral acceleration at end
-    
-    // Solve quintic polynomial for lateral motion
-    std::vector<double> lateral_coeffs = solve_quintic_polynomial(
-        d_start, d_dot_start, d_ddot_start,
-        d_end, d_dot_end, d_ddot_end, T);
-    
-    // Longitudinal motion parameters
+    // 새로운 평행 경로 생성 로직: baselink에서 시작하여 d_offset 고려
     double s_start = start_frenet.s;
     double s_dot_start = start_frenet.s_dot;
-    double s_ddot_start = 0.0;
-    
-    // Simple constant velocity longitudinal motion (can be improved with quartic polynomial)
     double target_s_dot = target_velocity;
     
     for (size_t i = 0; i < time_samples.size(); ++i) {
         double t = time_samples[i];
+        double d, d_dot, d_ddot;
         
-        // Calculate lateral position using quintic polynomial
-        double d = 0.0;
-        double d_dot = 0.0;
-        double d_ddot = 0.0;
-        
-        if (lateral_coeffs.size() >= 6) {
-            d = lateral_coeffs[0] + lateral_coeffs[1]*t + lateral_coeffs[2]*t*t + 
-                lateral_coeffs[3]*t*t*t + lateral_coeffs[4]*t*t*t*t + lateral_coeffs[5]*t*t*t*t*t;
-            d_dot = lateral_coeffs[1] + 2*lateral_coeffs[2]*t + 3*lateral_coeffs[3]*t*t + 
-                    4*lateral_coeffs[4]*t*t*t + 5*lateral_coeffs[5]*t*t*t*t;
-            d_ddot = 2*lateral_coeffs[2] + 6*lateral_coeffs[3]*t + 
-                     12*lateral_coeffs[4]*t*t + 20*lateral_coeffs[5]*t*t*t;
-        } else {
-            // Fallback to linear interpolation if polynomial solving fails
-            d = d_start + (d_end - d_start) * (t / T);
-            d_dot = (d_end - d_start) / T;
+        // 첫 번째 점은 항상 baselink(현재 위치)에서 시작
+        if (i == 0) {
+            d = start_frenet.d;  // baselink 점
+            d_dot = 0.0;
             d_ddot = 0.0;
+        } else {
+            // d_offset 크기에 따른 적응적 전환 로직
+            double abs_offset = std::abs(adjusted_target_lateral_offset - start_frenet.d);
+            
+            if (abs_offset < 0.1) {
+                // 작은 offset: 즉시 평행 경로로 전환
+                d = adjusted_target_lateral_offset;
+                d_dot = 0.0;
+                d_ddot = 0.0;
+            } else {
+                // d_offset이 클수록 더 많이 가서 직선 경로로 변환
+                double current_distance = current_speed * t;
+                
+                // offset 크기에 비례한 전환 거리 계산 (더 긴 전환으로 직선화)
+                double transition_distance = wheelbase_distance + abs_offset * 2.0;  // offset이 클수록 더 긴 전환
+                
+                if (current_distance <= transition_distance) {
+                    // 전환 구간: 거리 기반으로 부드럽게 전환
+                    double transition_progress = current_distance / transition_distance;
+                    
+                    // 3차 polynomial로 부드러운 전환 (큰 offset도 점진적으로)
+                    double t_norm = transition_progress;
+                    double blend = 3*pow(t_norm,2) - 2*pow(t_norm,3);  // smooth step function
+                    
+                    d = start_frenet.d + (adjusted_target_lateral_offset - start_frenet.d) * blend;
+                    
+                    // 1차 미분 계산
+                    double blend_dot_dist = (adjusted_target_lateral_offset - start_frenet.d) * 
+                                           (6*t_norm - 6*pow(t_norm,2)) / transition_distance;
+                    d_dot = blend_dot_dist * current_speed;
+                    
+                    // 2차 미분 계산
+                    double blend_ddot_dist = (adjusted_target_lateral_offset - start_frenet.d) * 
+                                            (6 - 12*t_norm) / (transition_distance*transition_distance);
+                    d_ddot = blend_ddot_dist * current_speed * current_speed;
+                } else {
+                    // 평행 구간: 목표 d_offset에서 평행하게 유지
+                    d = adjusted_target_lateral_offset;
+                    d_dot = 0.0;  // 평행하므로 lateral velocity는 0
+                    d_ddot = 0.0; // 평행하므로 lateral acceleration도 0
+                }
+            }
         }
         
         // Longitudinal motion with smooth acceleration
@@ -254,18 +341,68 @@ PathCandidate PathGenerator::generate_single_path(
 std::vector<double> PathGenerator::generate_time_samples() const {
     std::vector<double> samples;
     
-    // 차량 현재 위치부터 시작 (t=0 포함)
-    samples.push_back(0.0);  // 현재 위치에서 경로 분기 시작
+    // 차량 현재 위치에서 바로 분기: 매우 짧은 간격으로 조밀하게 샘플링
+    samples.push_back(0.0);  // 현재 위치
     
-    // 부드러운 시각화를 위한 조밀한 샘플링 (0.033초 간격)
-    double fine_dt = config_.dt / 3.0;  // 0.1초 -> 0.033초 간격
-    int num_samples = static_cast<int>(config_.planning_horizon / fine_dt);
+    // 더 강화된 즉시 분기를 위한 극도로 조밀한 초기 샘플링
+    double ultra_fine_dt = 0.01;  // 10ms 간격 (더 세밀)
+    double ultra_fine_horizon = 0.1;  // 첫 100ms에 집중
+    int ultra_fine_samples = static_cast<int>(ultra_fine_horizon / ultra_fine_dt);
     
-    for (int i = 1; i <= num_samples; ++i) {
-        samples.push_back(i * fine_dt);
+    for (int i = 1; i <= ultra_fine_samples; ++i) {
+        samples.push_back(i * ultra_fine_dt);
+    }
+    
+    // 초기 전환 구간 (0.1~0.3초)
+    double early_dt = 0.02;  // 20ms 간격
+    double early_horizon = 0.3;
+    double early_start = ultra_fine_horizon;
+    int early_samples = static_cast<int>((early_horizon - early_start) / early_dt);
+    
+    for (int i = 1; i <= early_samples; ++i) {
+        samples.push_back(early_start + i * early_dt);
+    }
+    
+    // 나머지 구간은 기존 간격으로
+    double remaining_horizon = config_.planning_horizon - early_horizon;
+    double normal_dt = config_.dt / 2.0;  // 0.05초 간격
+    int remaining_samples = static_cast<int>(remaining_horizon / normal_dt);
+    
+    for (int i = 1; i <= remaining_samples; ++i) {
+        samples.push_back(early_horizon + i * normal_dt);
     }
     
     return samples;
+}
+
+bool PathGenerator::is_within_track_bounds(double lateral_offset, double s_position) const {
+    if (!frenet_coord_) {
+        return true;  // No track bounds available, allow all paths
+    }
+    
+    // Get reference point at current s position
+    RefPoint ref_point = frenet_coord_->get_reference_point(s_position);
+    
+    // Much more generous bounds - allow paths that go slightly outside
+    // Instead of rejecting, let occupancy grid handle actual collision detection
+    double generous_margin = 0.5;  // 50cm extra margin
+    double left_bound = ref_point.width_left + generous_margin;
+    double right_bound = ref_point.width_right + generous_margin;
+    
+    // Only reject if extremely far outside
+    bool within_bounds = (lateral_offset >= -right_bound && lateral_offset <= left_bound);
+    
+    // Only log occasionally to avoid spam
+    static int log_count = 0;
+    if (log_count < 10 || log_count % 100 == 0) {
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+            "Track bounds check [%d]: d=%.3f, bounds=[%.2f, %.2f], result=%s", 
+            log_count, lateral_offset, -right_bound, left_bound, 
+            within_bounds ? "PASS" : "FAIL");
+    }
+    log_count++;
+    
+    return within_bounds;
 }
 
 std::vector<double> PathGenerator::generate_lateral_samples(double current_d) const {
@@ -295,13 +432,12 @@ std::vector<double> PathGenerator::generate_lateral_samples(double current_d) co
     
     int num_steps = static_cast<int>(2.0 * effective_max_offset / config_.lateral_step) + 1;
     
-    // Create lattice paths that transition from current position to target positions
-    // Center lattice targets raceline (d=0), others are offset from raceline
+    // baselink 기준 lateral sampling: 현재 위치에서 대칭적으로 샘플링
     double half_range = effective_max_offset;
     
     for (int i = 0; i < num_steps; ++i) {
-        // Target lateral positions relative to raceline
-        double target_offset = -half_range + i * config_.lateral_step;
+        // baselink 기준으로 대칭 샘플링 (-range ~ +range)
+        double target_offset = current_d + (-half_range + i * config_.lateral_step);
         samples.push_back(target_offset);
     }
     
@@ -324,8 +460,8 @@ std::vector<double> PathGenerator::generate_velocity_samples(double current_velo
     double min_vel = std::max(2.5, effective_velocity - 2.0);  // Lower bound
     double max_vel = std::min(config_.max_velocity, effective_velocity + 4.0);  // Upper bound
     
-    // Default to more samples for better velocity optimization
-    int num_samples = 7;  // More samples for better planning
+    // 성능 최적화: velocity 샘플 개수 감소
+    int num_samples = 3;  // 7->4로 감소하여 계산 부하 줄임
     
     // POSITION-AWARE CURVATURE CHECK: Use actual vehicle position
     if (frenet_coord_ && current_s > 0.0) {
@@ -335,7 +471,7 @@ std::vector<double> PathGenerator::generate_velocity_samples(double current_velo
         // Adjust velocity range based on current track curvature
         if (current_curvature > 0.3) {  // High curvature corner
             max_vel = std::min(max_vel, 5.0);  // Conservative in tight corners
-            num_samples = 5;  // Fewer samples in corners
+            num_samples = 5;  
             static rclcpp::Clock clock;
             RCLCPP_INFO_THROTTLE(rclcpp::get_logger("path_generator"), clock, 1000,
                 "[CORNER DETECTED] s=%.1f, curvature=%.3f, limiting max_vel to %.1f", 
@@ -420,11 +556,11 @@ double PathGenerator::calculate_path_cost(
             }
         }
         
-        // B. FORWARD PROJECTION: 경로 연장해서 미래 장애물 영향 계산
+        // B. 확장된 FORWARD PROJECTION: 먼 구간 장애물 미리 감지하여 불가능 경로 조기 제거
         if (!path.points.empty()) {
             const auto& last_point = path.points.back();
-            double look_ahead_distance = 8.0;  // 8m 앞까지 예측
-            int projection_steps = 20;  // 20개 점으로 분할
+            double look_ahead_distance = 12.0;  // 더 먼 거리까지 예측하여 장애물 조기 감지
+            int projection_steps = 15;  // 적절한 단계로 세밀한 예측
             
             for (int i = 1; i <= projection_steps; ++i) {
                 double step_distance = (look_ahead_distance / projection_steps) * i;
@@ -496,6 +632,11 @@ bool PathGenerator::check_collision(
         return false;
     }
     
+    if (path.points.empty()) {
+        return true;  // Empty path is considered unsafe
+    }
+    
+    // 전체 경로에 대해 충돌 검사 - 먼 구간의 장애물도 미리 감지
     for (const auto& point : path.points) {
         for (const auto& obstacle : obstacles) {
             double dx = point.x - obstacle.x;
@@ -503,12 +644,12 @@ bool PathGenerator::check_collision(
             double distance = std::sqrt(dx*dx + dy*dy);
             
             if (distance < config_.collision_radius) {
-                return true;  // Collision detected
+                return true;  // 충돌 감지 즉시 반환으로 조기 종료
             }
         }
     }
     
-    return false;  // No collision
+    return false;  // 전체 경로에서 충돌 없음
 }
 
 std::vector<double> PathGenerator::solve_quintic_polynomial(

@@ -49,9 +49,9 @@ struct ObstacleDetectionConfig {
     double velocity_estimation_window = 0.5; // 속도 추정 시간 윈도우 (초)
     double min_dynamic_velocity = 0.3;    // 동적 판정 최소 속도 (m/s)
     
-    // Occupancy grid 설정
-    int occupancy_threshold = 35;
-    double occupancy_inflation_radius = 0.4;
+    // Occupancy grid 설정 - 더 현실적인 값으로 조정
+    int occupancy_threshold = 60;  // 35 -> 60으로 상향 조정 (덜 민감하게)
+    double occupancy_inflation_radius = 0.25;  // 0.4 -> 0.25로 축소
     double proximity_search_radius = 3.0;
     bool unknown_is_obstacle = false;
 };

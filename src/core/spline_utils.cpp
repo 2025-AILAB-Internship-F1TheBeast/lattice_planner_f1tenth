@@ -27,7 +27,7 @@ std::vector<RefPoint> SplineUtils::load_reference_path_from_csv(
     
     std::string line;
     std::vector<std::string> headers;
-    int x_col = -1, y_col = -1, vel_col = -1;
+    int x_col = -1, y_col = -1, vel_col = -1, width_left_col = -1, width_right_col = -1;
     bool first_line = true;
     
     while (std::getline(file, line)) {
@@ -57,18 +57,25 @@ std::vector<RefPoint> SplineUtils::load_reference_path_from_csv(
                 } else if (header == "vx_mps" || header == "v" || header == "velocity" || 
                           header == "speed" || header.find("vel") != std::string::npos) {
                     vel_col = i;
+                } else if (header == "width_left_m" || header == "width_left" || header.find("width_left") != std::string::npos) {
+                    width_left_col = i;
+                } else if (header == "width_right_m" || header == "width_right" || header.find("width_right") != std::string::npos) {
+                    width_right_col = i;
                 }
             }
             
             // Fallback: if specific headers not found, try positional mapping
-            if (x_col == -1 || y_col == -1) {
+            if (x_col == -1 || y_col == -1 || width_left_col == -1 || width_right_col == -1) {
+                std::cout << "Headers not found by name, trying positional mapping..." << std::endl;
                 // For Spielberg format: x_m,y_m,width_left_m,width_right_m,vx_mps
                 if (headers.size() >= 5 && headers[0].find("x") != std::string::npos) {
-                    x_col = 0; y_col = 1; vel_col = 4;
+                    x_col = 0; y_col = 1; width_left_col = 2; width_right_col = 3; vel_col = 4;
+                    std::cout << "Using Spielberg format mapping" << std::endl;
                 }
                 // For slam format: s_m,x_m,y_m,vx_mps,width_left_m,width_right_m
-                else if (headers.size() >= 4 && headers[1].find("x") != std::string::npos) {
-                    x_col = 1; y_col = 2; vel_col = 3;
+                else if (headers.size() >= 6 && headers[1].find("x") != std::string::npos) {
+                    x_col = 1; y_col = 2; vel_col = 3; width_left_col = 4; width_right_col = 5;
+                    std::cout << "Using slam format mapping" << std::endl;
                 }
             }
             
@@ -77,10 +84,26 @@ std::vector<RefPoint> SplineUtils::load_reference_path_from_csv(
                 return path;
             }
             
+            std::cout << "=== CSV 헤더 파싱 결과 ===" << std::endl;
+            std::cout << "전체 헤더 개수: " << headers.size() << std::endl;
+            for (int i = 0; i < headers.size(); ++i) {
+                std::cout << "  [" << i << "] = '" << headers[i] << "'" << std::endl;
+            }
+            
             std::cout << "CSV column mapping - X: " << x_col << " (" << headers[x_col] 
-                      << "), Y: " << y_col << " (" << headers[y_col];
+                      << "), Y: " << y_col << " (" << headers[y_col] << ")";
             if (vel_col >= 0) {
-                std::cout << "), Velocity: " << vel_col << " (" << headers[vel_col] << ")";
+                std::cout << ", Velocity: " << vel_col << " (" << headers[vel_col] << ")";
+            }
+            if (width_left_col >= 0) {
+                std::cout << ", Width_Left: " << width_left_col << " (" << headers[width_left_col] << ")";
+            } else {
+                std::cout << ", Width_Left: NOT FOUND!";
+            }
+            if (width_right_col >= 0) {
+                std::cout << ", Width_Right: " << width_right_col << " (" << headers[width_right_col] << ")";
+            } else {
+                std::cout << ", Width_Right: NOT FOUND!";
             }
             std::cout << std::endl;
             
@@ -96,6 +119,21 @@ std::vector<RefPoint> SplineUtils::load_reference_path_from_csv(
                 point.y = std::stod(row[y_col]);
                 point.velocity = (vel_col >= 0 && vel_col < row.size()) ? 
                                 std::stod(row[vel_col]) : 5.0;  // Default velocity
+                
+                // Read width information if available
+                point.width_left = (width_left_col >= 0 && width_left_col < row.size()) ? 
+                                  std::stod(row[width_left_col]) : 1.0;  // Default 1m
+                point.width_right = (width_right_col >= 0 && width_right_col < row.size()) ? 
+                                   std::stod(row[width_right_col]) : 1.0;  // Default 1m
+                
+                // Debug: 처음 몇 개 점의 width 값 확인
+                static int width_log_count = 0;
+                if (width_log_count < 5) {
+                    std::cout << "CSV 파싱: x=" << point.x << ", y=" << point.y 
+                              << ", width_left=" << point.width_left << ", width_right=" << point.width_right 
+                              << ", col_indices: left=" << width_left_col << ", right=" << width_right_col << std::endl;
+                    width_log_count++;
+                }
             } catch (const std::exception& e) {
                 std::cerr << "Error parsing CSV line: " << line << std::endl;
                 continue;
@@ -254,6 +292,8 @@ RefPoint SplineUtils::interpolate_at_s(const std::vector<RefPoint>& path, double
     interpolated.velocity = p1.velocity + ratio * (p2.velocity - p1.velocity);
     interpolated.heading = p1.heading + ratio * normalize_angle(p2.heading - p1.heading);
     interpolated.curvature = p1.curvature + ratio * (p2.curvature - p1.curvature);
+    interpolated.width_left = p1.width_left + ratio * (p2.width_left - p1.width_left);
+    interpolated.width_right = p1.width_right + ratio * (p2.width_right - p1.width_right);
     
     return interpolated;
 }

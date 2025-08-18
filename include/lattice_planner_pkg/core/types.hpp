@@ -41,8 +41,11 @@ struct RefPoint {
     double curvature;
     double heading;
     double velocity;    // reference velocity
+    double width_left;  // left track boundary distance
+    double width_right; // right track boundary distance
     
-    RefPoint() : x(0.0), y(0.0), s(0.0), curvature(0.0), heading(0.0), velocity(0.0) {}
+    RefPoint() : x(0.0), y(0.0), s(0.0), curvature(0.0), heading(0.0), velocity(0.0), 
+                 width_left(1.0), width_right(1.0) {}  // default 1m each side
 };
 
 // Obstacle information
