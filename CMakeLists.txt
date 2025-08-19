@@ -16,6 +16,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(planning_custom_msgs REQUIRED)
+find_package(obstacle_detection_pkg REQUIRED)
 
 # Note: Messages moved to planning_custom_msgs package
 
@@ -28,6 +29,7 @@ add_executable(lattice_planner_node
   src/core/obstacle_detector.cpp
   src/core/spline_utils.cpp
   src/obstacle_detector.cpp
+  src/obstacle_subscriber.cpp
   src/path_selector.cpp
 )
 
@@ -42,6 +44,7 @@ ament_target_dependencies(lattice_planner_node
   tf2_ros
   tf2_geometry_msgs
   planning_custom_msgs
+  obstacle_detection_pkg
 )
 
 # Note: Using planning_custom_msgs for message types
@@ -54,9 +57,30 @@ target_include_directories(lattice_planner_node
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+# Obstacle Subscriber Node (standalone)
+add_executable(obstacle_subscriber_node 
+  src/obstacle_subscriber_node.cpp
+  src/obstacle_subscriber.cpp
+)
+
+ament_target_dependencies(obstacle_subscriber_node
+  rclcpp 
+  nav_msgs 
+  geometry_msgs 
+  std_msgs
+  visualization_msgs
+  obstacle_detection_pkg
+)
+
+target_include_directories(obstacle_subscriber_node
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
 # Install targets
 install(TARGETS 
         lattice_planner_node
+        obstacle_subscriber_node
         DESTINATION lib/${PROJECT_NAME})
 
 # Install header files

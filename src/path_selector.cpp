@@ -182,9 +182,16 @@ CandidateResult* PathSelector::selectOptimalPath(
         RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
             "✅ [FINAL CHOICE] Safe path selected: cost=%.3f, offset=%.3f", 
             chosen->cost, chosen->d_offset);
+        
+        // Apply path stability filter to reduce oscillation
+        chosen = applyPathStabilityFilter(chosen, candidates);
+        
     } else {
         RCLCPP_WARN(rclcpp::get_logger("path_selector"), "[DEBUG] PathSelector could not choose any path");
     }
+    
+    // Update stability state
+    updateStabilityState(chosen);
     
     return chosen;
 }
@@ -486,6 +493,78 @@ bool PathSelector::canReturnFromDetour(const CandidateResult* reference_candidat
            !reference_candidate->collided && 
            !reference_candidate->out_of_track &&
            detour_state_.detour_clear_frames >= config_.detour_return_clear_frames_threshold;
+}
+
+CandidateResult* PathSelector::applyPathStabilityFilter(CandidateResult* candidate, std::vector<CandidateResult>& candidates) {
+    if (!candidate || !stability_state_.has_previous_choice) {
+        return candidate;  // 첫 번째 선택이거나 후보가 없으면 그대로 반환
+    }
+    
+    // 이전 선택과의 lateral offset 차이 계산
+    double lateral_change = std::abs(candidate->d_offset - stability_state_.last_chosen_offset);
+    
+    // Cost 차이 계산 (안정성을 위한 패널티 적용)
+    double cost_difference = candidate->cost - stability_state_.last_chosen_cost;
+    double stability_penalty = lateral_change * config_.lateral_change_penalty;
+    double adjusted_cost_difference = cost_difference + stability_penalty;
+    
+    // Hysteresis 조건: 새 경로가 충분히 좋아야만 변경 허용
+    bool should_switch = adjusted_cost_difference < -config_.cost_difference_threshold;
+    
+    if (!should_switch) {
+        // 이전 선택과 유사한 경로 찾기
+        CandidateResult* similar_path = nullptr;
+        double min_lateral_diff = std::numeric_limits<double>::max();
+        
+        for (auto& c : candidates) {
+            // 안전한 경로만 고려
+            if (c.collided || c.out_of_track) continue;
+            
+            double lateral_diff = std::abs(c.d_offset - stability_state_.last_chosen_offset);
+            if (lateral_diff < min_lateral_diff) {
+                min_lateral_diff = lateral_diff;
+                similar_path = &c;
+            }
+        }
+        
+        // 유사한 경로가 있고 충분히 가까우면 사용
+        if (similar_path && min_lateral_diff < 0.2) {  // 20cm 이내
+            stability_state_.stability_counter++;
+            RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+                "[STABILITY] Keeping similar path: %.3f->%.3f (diff: %.3f, counter: %d)", 
+                stability_state_.last_chosen_offset, similar_path->d_offset, 
+                min_lateral_diff, stability_state_.stability_counter);
+            return similar_path;
+        }
+    }
+    
+    // 경로 변경이 허용된 경우 안정성 카운터 리셋
+    if (should_switch || lateral_change > 0.3) {  // 30cm 이상 변경
+        stability_state_.stability_counter = 0;
+        RCLCPP_INFO(rclcpp::get_logger("path_selector"), 
+            "[STABILITY] Path change allowed: %.3f->%.3f (cost_diff: %.3f, penalty: %.3f)", 
+            stability_state_.last_chosen_offset, candidate->d_offset, 
+            cost_difference, stability_penalty);
+    }
+    
+    return candidate;
+}
+
+void PathSelector::updateStabilityState(const CandidateResult* chosen_path) {
+    if (chosen_path) {
+        stability_state_.last_chosen_offset = chosen_path->d_offset;
+        stability_state_.last_chosen_cost = chosen_path->cost;
+        stability_state_.has_previous_choice = true;
+        
+        // 안정성 카운터 업데이트 (동일한 경로 선택 시 증가)
+        if (stability_state_.has_previous_choice) {
+            double lateral_change = std::abs(chosen_path->d_offset - stability_state_.last_chosen_offset);
+            if (lateral_change < 0.05) {  // 5cm 이내면 동일한 경로로 간주
+                stability_state_.stability_counter = std::min(stability_state_.stability_counter + 1, 
+                                                           config_.stability_frame_count);
+            }
+        }
+    }
 }
 
 } // namespace advanced

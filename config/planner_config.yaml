@@ -5,7 +5,7 @@ lattice_planner:
     # Reference path (relative to package)
     # reference_path_file: "slam_map_global"  # Will be resolved to package/config/reference_paths/
     # reference_path_file: "Spielberg_global"
-    reference_path_file: "slam_tool_box"
+    reference_path_file: "slamtoolbox_raceline"
     path_resolution: 0.1
     
     # Planning parameters (최적화: 샘플링 개수 감소)
@@ -20,10 +20,10 @@ lattice_planner:
     wheelbase: 0.33             # Vehicle wheelbase (m)
     max_curvature: 1.0          # Maximum path curvature (1/m)
     
-    # Cost weights
+    # Cost weights (곡률 비용 제거)
     obstacle_cost_weight: 10.0
     lateral_cost_weight: 5.0  # Maximum lateral cost weight for extreme raceline preference
-    curvature_cost_weight: 0.05  # Reduced to allow faster corner recovery
+    curvature_cost_weight: 0.0  # 곡률 비용 완전 제거 - 차량 흔들림 방지
     longitudinal_cost_weight: 0.02  # Further reduced for speed prioritization
     
     # Safety parameters

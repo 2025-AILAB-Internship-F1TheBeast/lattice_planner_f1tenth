@@ -44,6 +44,11 @@ struct PathSelectionConfig {
     bool path_length_commit_mode = true;           // 경로 길이 기반 커밋 활성화
     double path_length = 4.0;                     // 커밋 경로 길이 (m) - 장애물 회피 안정성 향상
     double obstacle_path_length_multiplier = 1.5;  // 장애물 상황에서 경로 길이 배수
+    
+    // Hysteresis/Smoothing parameters for path stability
+    double cost_difference_threshold = 0.15;      // 경로 변경을 위한 최소 cost 차이
+    int stability_frame_count = 3;                // 안정성을 위한 연속 프레임 수
+    double lateral_change_penalty = 0.5;          // 횡방향 변화에 대한 패널티 가중치
 };
 
 struct PathCommitState {
@@ -62,6 +67,13 @@ struct PathCommitState {
 struct DetourState {
     bool detour_active = false;
     int detour_clear_frames = 0;
+};
+
+struct PathStabilityState {
+    double last_chosen_offset = 0.0;              // 마지막으로 선택된 경로의 offset
+    double last_chosen_cost = 0.0;                // 마지막으로 선택된 경로의 cost
+    int stability_counter = 0;                    // 안정성 카운터
+    bool has_previous_choice = false;             // 이전 선택 기록이 있는지
 };
 
 class PathSelector {
@@ -98,6 +110,7 @@ private:
     PathSelectionConfig config_;
     PathCommitState commit_state_;
     DetourState detour_state_;
+    PathStabilityState stability_state_;
     
     // 내부 헬퍼 함수들
     CandidateResult* selectPrimaryPath(std::vector<CandidateResult>& candidates, bool has_obstacles);
@@ -111,6 +124,10 @@ private:
     );
     void updateDetourState(const CandidateResult* reference_candidate);
     bool canReturnFromDetour(const CandidateResult* reference_candidate) const;
+    
+    // Hysteresis/stability functions
+    CandidateResult* applyPathStabilityFilter(CandidateResult* candidate, std::vector<CandidateResult>& candidates);
+    void updateStabilityState(const CandidateResult* chosen_path);
 };
 
 } // namespace advanced

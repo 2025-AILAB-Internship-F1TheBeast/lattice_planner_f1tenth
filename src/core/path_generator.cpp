@@ -531,15 +531,7 @@ double PathGenerator::calculate_path_cost(
     double lateral_cost_normalized = std::abs(path.lateral_offset) / config_.max_lateral_offset;
     lateral_cost_normalized = std::min(1.0, lateral_cost_normalized);
     
-    // 2. 곡률 비용 (0-1 정규화)
-    double curvature_cost_normalized = 0.0;
-    double max_curvature_in_path = 0.0;
-    for (const auto& point : path.points) {
-        max_curvature_in_path = std::max(max_curvature_in_path, std::abs(point.curvature));
-    }
-    curvature_cost_normalized = std::min(1.0, max_curvature_in_path / config_.max_curvature);
-    
-    // 3. 장애물 관련 비용 (FORWARD LOOK-AHEAD 시스템)
+    // 2. 장애물 관련 비용 (FORWARD LOOK-AHEAD 시스템)
     double obstacle_cost_normalized = 0.0;
     if (!obstacles.empty()) {
         double max_obstacle_cost = 0.0;
@@ -600,29 +592,45 @@ double PathGenerator::calculate_path_cost(
         }
     }
     
-    // === 가중치 합을 통한 최종 비용 계산 ===
-    double cost = 
-        lateral_cost_normalized * config_.lateral_cost_weight +
-        curvature_cost_normalized * config_.curvature_cost_weight +
-        obstacle_cost_normalized * config_.obstacle_cost_weight;
+    // === 가중치 합을 통한 최종 비용 계산 (곡률 제외) ===
     
-    // 레이스라인 보너스 (기존 로직 유지)
+    // 1. 개별 비용 계산 (가중치 적용)
+    double weighted_lateral_cost = lateral_cost_normalized * config_.lateral_cost_weight;
+    double weighted_obstacle_cost = obstacle_cost_normalized * config_.obstacle_cost_weight;
+    
+    // 2. 총 비용 합계 (곡률 비용 제외)
+    double total_cost = weighted_lateral_cost + weighted_obstacle_cost;
+    
+    // 3. 레이스라인 보너스 적용
+    double raceline_bonus = 1.0;
     if (std::abs(path.lateral_offset) < 0.05) {
-        cost *= 0.8;  // 20% 보너스
+        raceline_bonus = 0.8;  // 20% 보너스
     }
     
-    // Debug: 정규화된 비용 시스템 로깅
+    // 4. 최종 비용
+    double final_cost = total_cost * raceline_bonus;
+    
+    // Debug: 비용 구성 요소별 상세 로깅 (곡률 제외)
     static int cost_log_count = 0;
     if (cost_log_count < 5) {
         RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
-            "[NORMALIZED COST] offset=%.3f: lateral=%.3f, curvature=%.3f, obstacle=%.3f, final=%.3f %s", 
-            path.lateral_offset, lateral_cost_normalized, curvature_cost_normalized, 
-            obstacle_cost_normalized, cost,
+            "[COST BREAKDOWN] offset=%.3f:\n"
+            "  1. Lateral:   norm=%.3f * weight=%.1f = %.3f\n"
+            "  2. Obstacle:  norm=%.3f * weight=%.1f = %.3f\n"
+            "  3. Total:     %.3f\n"
+            "  4. Raceline:  bonus=%.1f\n"
+            "  5. Final:     %.3f %s", 
+            path.lateral_offset,
+            lateral_cost_normalized, config_.lateral_cost_weight, weighted_lateral_cost,
+            obstacle_cost_normalized, config_.obstacle_cost_weight, weighted_obstacle_cost,
+            total_cost,
+            raceline_bonus,
+            final_cost,
             (std::abs(path.lateral_offset) < 0.05) ? "*** RACELINE ***" : "");
         cost_log_count++;
     }
     
-    return cost;
+    return final_cost;
 }
 
 bool PathGenerator::check_collision(

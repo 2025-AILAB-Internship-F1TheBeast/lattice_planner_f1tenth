@@ -22,6 +22,7 @@
   <depend>tf2_geometry_msgs</depend>
   <depend>ackermann_msgs</depend>
   <depend>planning_custom_msgs</depend>
+  <depend>obstacle_detection_pkg</depend>
 
 
   <test_depend>ament_lint_auto</test_depend>
