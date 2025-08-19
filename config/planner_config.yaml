@@ -8,38 +8,41 @@ lattice_planner:
     reference_path_file: "slamtoolbox_raceline"
     path_resolution: 0.1
     
-    # Planning parameters (최적화: 샘플링 개수 감소)
-    lateral_step: 0.15           # Lateral sampling step (m) - 증가로 샘플 개수 감소
-    max_lateral_offset: 1.0     # Maximum lateral offset (m) - 감소로 범위 축소
+    # Planning parameters (optimized for performance)
+    lateral_step: 0.15           # Lateral sampling step (m)
+    max_lateral_offset: 1.0     # Maximum lateral offset (m)
     planning_horizon: 1.3       # Planning time horizon (s)
-    dt: 0.1                     # Time step (s) - reduced for smoother paths and faster updates
-    planning_frequency: 40.0    # Planning frequency (Hz) - further increased for reactive corner handling
+    dt: 0.1                     # Time step (s)
+    planning_frequency: 40.0    # Planning frequency (Hz)
     
     # Vehicle parameters
     max_velocity: 8.0          # Maximum velocity (m/s)
     wheelbase: 0.33             # Vehicle wheelbase (m)
     max_curvature: 1.0          # Maximum path curvature (1/m)
     
-    # Cost weights (곡률 비용 제거)
+    # Cost weights (tuned for stable raceline following)
     obstacle_cost_weight: 10.0
-    lateral_cost_weight: 5.0  # Maximum lateral cost weight for extreme raceline preference
-    curvature_cost_weight: 0.0  # 곡률 비용 완전 제거 - 차량 흔들림 방지
-    longitudinal_cost_weight: 0.02  # Further reduced for speed prioritization
+    lateral_cost_weight: 5.0        # Maximum lateral cost weight for raceline preference
+    curvature_cost_weight: 0.0      # Curvature cost removed to prevent oscillation
+    longitudinal_cost_weight: 0.02  # Reduced for speed prioritization
     
     # Safety parameters
-    safety_margin: 0.12         # Safety margin around obstacles (m) - 축소
-    collision_radius: 0.35      # Vehicle collision radius (m) - F1TENTH 차량 크기에 맞게 축소
+    safety_margin: 0.12         # Safety margin around obstacles (m)
+    collision_radius: 0.35      # Vehicle collision radius (m)
     obstacle_detection_range: 8.0  # Obstacle detection range (m)
     
-    # Occupancy grid settings - 장애물 감지 강화
-    inline_occupancy_inflation_radius: 0.25   # 벽에서 30cm 안전거리
-    occupancy_threshold: 85     # threshold 증가 (덜 민감한 장애물 감지)
-    occupancy_grid_topic: "/updated_map"  # Use updated map from obstacle detection
+    # Occupancy grid settings
+    inline_occupancy_inflation_radius: 0.25   # Safety distance from walls (m)
+    occupancy_threshold: 85                    # Threshold for obstacle detection (higher = less sensitive)
+    occupancy_grid_topic: "/updated_map"       # Map topic (remapped in launch file)
+    
+    # Obstacle detection control
+    enable_lidar_obstacles_without_map: false  # Enable LiDAR obstacle detection even without map data
     
     # Additional cost weights
-    obstacle_existence_weight: 2.0  # 장애물 존재 가중치 
-    unknown_area_weight: 0.8        # 미지 영역 회피
-    obstacle_distance_weight: 1.5   # 거리 기반 가중치
+    obstacle_existence_weight: 2.0  # Obstacle existence weight
+    unknown_area_weight: 0.8        # Unknown area avoidance weight
+    obstacle_distance_weight: 1.5   # Distance-based obstacle weight
     
     # Path selection configuration for stability
     path_selection:

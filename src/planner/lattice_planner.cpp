@@ -101,6 +101,7 @@ bool LatticePlanner::initialize() {
     this->declare_parameter("occupancy_threshold", 75);
     this->declare_parameter("safety_margin", 0.15);
     this->declare_parameter("obstacle_detection_range", 8.0);
+    this->declare_parameter("enable_lidar_obstacles_without_map", false);
     
     // Declare path selection parameters
     this->declare_parameter("path_selection.commit_min_progress", 1.0);
@@ -251,9 +252,7 @@ bool LatticePlanner::initialize() {
         occupancy_grid_topic, 10,
         std::bind(&LatticePlanner::grid_callback, this, std::placeholders::_1));
     
-    RCLCPP_WARN(this->get_logger(), "=== LATTICE PLANNER MAP TOPIC DEBUG ===");
-    RCLCPP_WARN(this->get_logger(), "Config occupancy_grid_topic: %s", occupancy_grid_topic.c_str());
-    RCLCPP_WARN(this->get_logger(), "Subscribing to occupancy grid topic: %s", occupancy_grid_topic.c_str());
+    RCLCPP_INFO(this->get_logger(), "Subscribing to occupancy grid topic: %s", occupancy_grid_topic.c_str());
     
     // Initialize planning timer
     auto timer_period = std::chrono::milliseconds(static_cast<int>(1000.0 / planning_frequency));
@@ -365,11 +364,11 @@ void LatticePlanner::laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr
         "[LIDAR] %zu tracked, %zu dynamic obstacles", 
         tracked_obstacles.size(), dynamic_obstacles.size());
     
-    // Check if we have map data - if not, disable obstacle detection for testing
-    if (!current_grid_) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "=== NO MAP DATA - DISABLING LIDAR OBSTACLE DETECTION FOR TESTING ===");
-        current_obstacles_.clear(); // No obstacles when no map for testing
+    // Check if LiDAR obstacle detection should be disabled when no map data
+    if (!current_grid_ && !this->get_parameter("enable_lidar_obstacles_without_map").as_bool()) {
+        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "No map data available - LiDAR obstacle detection disabled");
+        current_obstacles_.clear();
         return;
     }
     
@@ -379,9 +378,9 @@ void LatticePlanner::laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr
 }
 
 void LatticePlanner::grid_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
-        "=== RECEIVED MAP DATA === Topic: %s, Frame: %s, Size: %dx%d", 
-        "via_callback", msg->header.frame_id.c_str(), msg->info.width, msg->info.height);
+    RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+        "Received map data: Frame=%s, Size=%dx%d", 
+        msg->header.frame_id.c_str(), msg->info.width, msg->info.height);
     
     if (!odom_received_) return;
     
