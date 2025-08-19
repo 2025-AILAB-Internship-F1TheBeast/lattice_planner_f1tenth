@@ -4,8 +4,8 @@ lattice_planner:
   ros__parameters:
     # Reference path (relative to package)
     # reference_path_file: "slam_map_global"  # Will be resolved to package/config/reference_paths/
-    # reference_path_file: "Spielberg_global"
-    reference_path_file: "slamtoolbox_raceline"
+    reference_path_file: "Spielberg_global"
+    # reference_path_file: "slamtoolbox_raceline"
     path_resolution: 0.1
     
     # Planning parameters (최적화: 샘플링 개수 감소)
@@ -16,7 +16,7 @@ lattice_planner:
     planning_frequency: 40.0    # Planning frequency (Hz) - further increased for reactive corner handling
     
     # Vehicle parameters
-    max_velocity: 5.0          # Maximum velocity (m/s)
+    max_velocity: 6.0          # Maximum velocity (m/s)
     wheelbase: 0.33             # Vehicle wheelbase (m)
     max_curvature: 1.0          # Maximum path curvature (1/m)
     

@@ -96,74 +96,42 @@ std::vector<PathCandidate> PathGenerator::generate_paths(
     // Disable speed sampling: use a single target velocity (clamped to limits)
     double target_velocity = std::min(config_.max_velocity, std::max(2.5, vehicle_velocity));
 
-    // Generate paths for lateral samples only
-    static int generation_count = 0;
-    bool should_log = (generation_count < 5 || generation_count % 50 == 0);
-    
-    if (should_log) {
-        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
-            "=== 경로 생성 시작 [%d]: %zu개 lateral samples ===", generation_count, lateral_samples.size());
-    }
-    
+    // Generate paths for lateral samples - optimized for performance
     for (double lateral_offset : lateral_samples) {
         PathCandidate candidate = generate_single_path(
             start_frenet, lateral_offset, target_velocity);
             
         if (!candidate.points.empty()) {
-            // Set lateral offset BEFORE cost calculation
             candidate.lateral_offset = lateral_offset;
             
-            // Improved track bounds checking: only check start, middle, and end points to reduce computation
+            // Efficient track bounds checking: only key points
             candidate.out_of_track = false;
             std::vector<size_t> check_indices;
             if (candidate.points.size() <= 3) {
-                // Small path, check all points
                 for (size_t i = 0; i < candidate.points.size(); ++i) {
                     check_indices.push_back(i);
                 }
             } else {
-                // Large path, check strategically: start, middle, end
-                check_indices.push_back(0);
-                check_indices.push_back(candidate.points.size() / 2);
-                check_indices.push_back(candidate.points.size() - 1);
+                check_indices = {0, candidate.points.size() / 2, candidate.points.size() - 1};
             }
             
             for (size_t idx : check_indices) {
                 const auto& point = candidate.points[idx];
-                // Convert cartesian point back to frenet to get s position
                 FrenetPoint frenet_point = frenet_coord_->cartesian_to_frenet(Point2D(point.x, point.y));
                 
                 if (!is_within_track_bounds(frenet_point.d, frenet_point.s)) {
                     candidate.out_of_track = true;
-                    if (should_log) {
-                        RCLCPP_WARN(rclcpp::get_logger("path_generator"), 
-                            "Path OUT_OF_TRACK: offset=%.3f at point %zu", lateral_offset, idx);
-                    }
                     break;
                 }
             }
             
-            // Calculate cost and check collision for all paths (including out_of_track ones)
+            // Calculate cost and safety
             candidate.cost = calculate_path_cost(candidate, obstacles);
             candidate.is_safe = !check_collision(candidate, obstacles);
             
-            // Add all paths to candidates (let path selector decide what to do)
             candidates.push_back(candidate);
-            
-            if (should_log) {
-                RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
-                    "Path added: offset=%.3f, safe=%s, out_of_track=%s, cost=%.2f", 
-                    lateral_offset, candidate.is_safe ? "YES" : "NO",
-                    candidate.out_of_track ? "YES" : "NO", candidate.cost);
-            }
         }
     }
-    
-    if (should_log) {
-        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
-            "=== 경로 생성 완료 [%d]: %zu개 후보 경로 반환 ===", generation_count, candidates.size());
-    }
-    generation_count++;
     
     return candidates;
 }

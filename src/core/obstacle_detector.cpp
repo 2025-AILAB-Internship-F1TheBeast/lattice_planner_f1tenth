@@ -69,8 +69,8 @@ std::vector<Obstacle> ObstacleDetector::detect_from_occupancy_grid(
         return obstacles;
     }
     
-    // Scan around vehicle position
-    int search_radius = static_cast<int>(config_.obstacle_detection_range / grid->info.resolution);
+    // Reduced search radius for better performance
+    int search_radius = static_cast<int>(std::min(5.0, config_.obstacle_detection_range) / grid->info.resolution);
     
     int center_x, center_y;
     if (!world_to_grid(*grid, vehicle_position, center_x, center_y)) {
