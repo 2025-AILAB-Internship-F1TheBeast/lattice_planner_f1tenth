@@ -219,7 +219,7 @@ PathCandidate PathGenerator::generate_single_path(
                 double current_distance = current_speed * t;
                 
                 // offset 크기에 비례한 전환 거리 계산 (더 긴 전환으로 직선화)
-                double transition_distance = wheelbase_distance + abs_offset * 2.0;  // offset이 클수록 더 긴 전환
+                double transition_distance = config_.base_straight_distance + abs_offset * config_.offset_transition_multiplier;
                 
                 if (current_distance <= transition_distance) {
                     // 전환 구간: 거리 기반으로 부드럽게 전환

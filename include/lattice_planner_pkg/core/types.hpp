@@ -81,6 +81,10 @@ struct PlannerConfig {
     double planning_horizon;       // T planning time
     double dt;                     // time step
     
+    // Lattice transition parameters
+    double base_straight_distance;        // Base straight distance before spreading (m)
+    double offset_transition_multiplier;  // Multiplier for offset-based transition distance
+    
     // Vehicle parameters
     double wheelbase;
     double max_velocity;

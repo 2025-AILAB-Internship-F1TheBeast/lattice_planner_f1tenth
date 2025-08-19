@@ -84,6 +84,8 @@ bool LatticePlanner::initialize() {
     this->declare_parameter("path_resolution", 0.1);
     this->declare_parameter("lateral_step", 0.3);
     this->declare_parameter("max_lateral_offset", 1.2);
+    this->declare_parameter("base_straight_distance", 0.5);
+    this->declare_parameter("offset_transition_multiplier", 2.0);
     this->declare_parameter("planning_horizon", 1.0);
     this->declare_parameter("dt", 0.1);
     this->declare_parameter("max_velocity", 5.0);
@@ -125,6 +127,8 @@ bool LatticePlanner::initialize() {
     config_.path_resolution = this->get_parameter("path_resolution").as_double();
     config_.lateral_step = this->get_parameter("lateral_step").as_double();
     config_.max_lateral_offset = this->get_parameter("max_lateral_offset").as_double();
+    config_.base_straight_distance = this->get_parameter("base_straight_distance").as_double();
+    config_.offset_transition_multiplier = this->get_parameter("offset_transition_multiplier").as_double();
     config_.planning_horizon = this->get_parameter("planning_horizon").as_double();
     config_.dt = this->get_parameter("dt").as_double();
     config_.max_velocity = this->get_parameter("max_velocity").as_double();

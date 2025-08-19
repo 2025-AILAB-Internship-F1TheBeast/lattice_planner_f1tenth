@@ -6,14 +6,19 @@ lattice_planner:
     # reference_path_file: "slam_map_global"  # Will be resolved to package/config/reference_paths/
     # reference_path_file: "Spielberg_global"
     reference_path_file: "slamtoolbox_raceline"
+    # reference_path_file: "first_map_raceline"
     path_resolution: 0.1
     
     # Planning parameters (optimized for performance)
-    lateral_step: 0.15           # Lateral sampling step (m)
+    lateral_step: 0.25           # Lateral sampling step (m)
     max_lateral_offset: 1.0     # Maximum lateral offset (m)
     planning_horizon: 1.3       # Planning time horizon (s)
     dt: 0.1                     # Time step (s)
     planning_frequency: 40.0    # Planning frequency (Hz)
+    
+    # Lattice transition parameters
+    base_straight_distance: 2.3  # Base straight distance before spreading (m)
+    offset_transition_multiplier: 1.5  # Multiplier for offset-based transition distance
     
     # Vehicle parameters
     max_velocity: 8.0          # Maximum velocity (m/s)

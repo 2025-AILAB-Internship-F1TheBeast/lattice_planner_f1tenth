@@ -31,11 +31,28 @@ std::vector<RefPoint> SplineUtils::load_reference_path_from_csv(
     bool first_line = true;
     
     while (std::getline(file, line)) {
+        // Skip comment lines starting with #
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        
         std::stringstream ss(line);
         std::string cell;
         std::vector<std::string> row;
         
-        while (std::getline(ss, cell, ',')) {
+        // Auto-detect delimiter (comma or semicolon)
+        char delimiter = ',';
+        if (line.find(';') != std::string::npos && line.find(',') == std::string::npos) {
+            delimiter = ';';
+        } else if (line.find(';') != std::string::npos && line.find(',') != std::string::npos) {
+            // If both exist, use the more frequent one
+            delimiter = (std::count(line.begin(), line.end(), ';') > std::count(line.begin(), line.end(), ',')) ? ';' : ',';
+        }
+        
+        while (std::getline(ss, cell, delimiter)) {
+            // Trim whitespace from each cell
+            cell.erase(0, cell.find_first_not_of(" \t"));
+            cell.erase(cell.find_last_not_of(" \t") + 1);
             row.push_back(cell);
         }
         
@@ -57,9 +74,9 @@ std::vector<RefPoint> SplineUtils::load_reference_path_from_csv(
                 } else if (header == "vx_mps" || header == "v" || header == "velocity" || 
                           header == "speed" || header.find("vel") != std::string::npos) {
                     vel_col = i;
-                } else if (header == "width_left_m" || header == "width_left" || header.find("width_left") != std::string::npos) {
+                } else if (header == "width_left_m" || header == "width_left" || header == "wl_m" || header.find("width_left") != std::string::npos) {
                     width_left_col = i;
-                } else if (header == "width_right_m" || header == "width_right" || header.find("width_right") != std::string::npos) {
+                } else if (header == "width_right_m" || header == "width_right" || header == "wr_m" || header.find("width_right") != std::string::npos) {
                     width_right_col = i;
                 }
             }
