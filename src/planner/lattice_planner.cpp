@@ -508,22 +508,53 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
         }
     }
     
-    // Apply hysteresis to prevent oscillation
+    // Enhanced hysteresis to prevent oscillation in straight sections
     const auto& selected = candidates[best_idx];
+    
+    // First, try to maintain current path if it's still valid and reasonably good
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto& candidate = candidates[i];
+        double offset_diff = std::abs(candidate.lateral_offset - last_selected_offset_);
+        
+        // Stay with current path if:
+        // 1. Offset is very close (within 0.1m)
+        // 2. Path is safe and not out of track
+        // 3. Cost is not significantly worse than best path
+        if (offset_diff < 0.1 && 
+            candidate.is_safe && !candidate.out_of_track &&
+            candidate.cost < (min_cost * 1.2)) {  // Allow 20% cost tolerance
+            return candidate;
+        }
+    }
+    
+    // Apply time-based hysteresis for larger changes
     if (should_switch_path(selected.lateral_offset, last_selected_offset_)) {
         last_selected_offset_ = selected.lateral_offset;
         last_path_change_time_ = this->get_clock()->now();
     } else {
-        // Try to keep previous path if still available and safe
+        // Try to find a compromise path closer to current selection
+        double best_compromise_cost = std::numeric_limits<double>::max();
+        size_t compromise_idx = best_idx;
+        
         for (size_t i = 0; i < candidates.size(); ++i) {
-            if (std::abs(candidates[i].lateral_offset - last_selected_offset_) < 0.05 && 
-                candidates[i].is_safe && !candidates[i].out_of_track) {
-                return candidates[i];
+            if (!candidates[i].is_safe || candidates[i].out_of_track) continue;
+            
+            double offset_diff = std::abs(candidates[i].lateral_offset - last_selected_offset_);
+            double compromise_cost = candidates[i].cost + offset_diff * 2.0; // Penalty for offset change
+            
+            if (compromise_cost < best_compromise_cost) {
+                best_compromise_cost = compromise_cost;
+                compromise_idx = i;
             }
         }
-        // Force switch if previous path no longer safe
-        last_selected_offset_ = selected.lateral_offset;
-        last_path_change_time_ = this->get_clock()->now();
+        
+        // If compromise path is significantly different, update tracking
+        if (std::abs(candidates[compromise_idx].lateral_offset - last_selected_offset_) > 0.05) {
+            last_selected_offset_ = candidates[compromise_idx].lateral_offset;
+            last_path_change_time_ = this->get_clock()->now();
+        }
+        
+        return candidates[compromise_idx];
     }
     
     return selected;

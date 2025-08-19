@@ -75,8 +75,8 @@ private:
     // Simple path stability to prevent oscillation
     double last_selected_offset_;
     rclcpp::Time last_path_change_time_;
-    static constexpr double PATH_CHANGE_COOLDOWN = 0.3; // seconds
-    static constexpr double OFFSET_CHANGE_THRESHOLD = 0.2; // lateral offset threshold
+    static constexpr double PATH_CHANGE_COOLDOWN = 1.0; // seconds (increased for stability)
+    static constexpr double OFFSET_CHANGE_THRESHOLD = 0.4; // lateral offset threshold (increased for stability)
     
     // Cleaned up - removed all unnecessary complexity variables
     
