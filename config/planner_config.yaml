@@ -27,13 +27,16 @@ lattice_planner:
     longitudinal_cost_weight: 0.02  # Further reduced for speed prioritization
     
     # Safety parameters
-    safety_margin: 0.3          # Safety margin around obstacles (m)
-    collision_radius: 0.5       # Vehicle collision radius (m)
+    safety_margin: 0.15         # Safety margin around obstacles (m) - 축소
+    collision_radius: 0.35      # Vehicle collision radius (m) - F1TENTH 차량 크기에 맞게 축소
     obstacle_detection_range: 8.0  # Obstacle detection range (m)
     
-    # Occupancy grid settings - 확실한 벽만 감지 (false positive 방지)
-    inline_occupancy_inflation_radius: 0.25   # 벽에서 15cm만 (최소한의 안전거리)
-    occupancy_threshold: 90     # 매우 높은 threshold (확실한 벽만)
-    obstacle_existence_weight: 0.0
-    unknown_area_weight: 0.0
-    obstacle_distance_weight: 0.0
+    # Occupancy grid settings - 장애물 감지 강화
+    inline_occupancy_inflation_radius: 0.3   # 벽에서 30cm 안전거리
+    occupancy_threshold: 75     # threshold 증가 (덜 민감한 장애물 감지)
+    occupancy_grid_topic: "/map"  # 점유 격자 토픽
+    
+    # Additional cost weights
+    obstacle_existence_weight: 3.0  # 장애물 존재 가중치 
+    unknown_area_weight: 1.0        # 미지 영역 회피
+    obstacle_distance_weight: 2.0   # 거리 기반 가중치

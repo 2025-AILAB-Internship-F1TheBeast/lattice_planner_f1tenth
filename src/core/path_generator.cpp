@@ -383,13 +383,15 @@ bool PathGenerator::is_within_track_bounds(double lateral_offset, double s_posit
     // Get reference point at current s position
     RefPoint ref_point = frenet_coord_->get_reference_point(s_position);
     
-    // Much more generous bounds - allow paths that go slightly outside
-    // Instead of rejecting, let occupancy grid handle actual collision detection
-    double generous_margin = 0.5;  // 50cm extra margin
-    double left_bound = ref_point.width_left + generous_margin;
-    double right_bound = ref_point.width_right + generous_margin;
+    // Correct track bounds calculation
+    // width_left = distance from centerline to left boundary (positive)
+    // width_right = distance from centerline to right boundary (positive)
+    // So valid d range is [-width_right, +width_left]
+    double generous_margin = 0.3;  // 30cm extra margin
+    double left_bound = ref_point.width_left + generous_margin;   // positive limit
+    double right_bound = ref_point.width_right + generous_margin; // negative limit (magnitude)
     
-    // Only reject if extremely far outside
+    // Correct bounds check: d should be in [-right_bound, +left_bound]
     bool within_bounds = (lateral_offset >= -right_bound && lateral_offset <= left_bound);
     
     // Only log occasionally to avoid spam
@@ -636,6 +638,17 @@ bool PathGenerator::check_collision(
         return true;  // Empty path is considered unsafe
     }
     
+    // Debug: raceline 경로에 대해 주기적으로 로깅
+    static int log_counter = 0;
+    bool should_log = (std::abs(path.lateral_offset) < 0.1) && (log_counter++ % 50 == 0); // raceline, 50회마다
+    
+    if (should_log) {
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+            "[COLLISION DEBUG] Checking raceline with %zu obstacles, collision_radius=%.3f", 
+            obstacles.size(), config_.collision_radius);
+        // log_counter는 이미 증가됨
+    }
+    
     // 전체 경로에 대해 충돌 검사 - 먼 구간의 장애물도 미리 감지
     for (const auto& point : path.points) {
         for (const auto& obstacle : obstacles) {
@@ -643,10 +656,26 @@ bool PathGenerator::check_collision(
             double dy = point.y - obstacle.y;
             double distance = std::sqrt(dx*dx + dy*dy);
             
+            if (should_log && distance < 2.0) { // 2m 이내 장애물만 로깅
+                RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+                    "[COLLISION DEBUG] Point(%.2f,%.2f) vs Obstacle(%.2f,%.2f): dist=%.3f (threshold=%.3f)", 
+                    point.x, point.y, obstacle.x, obstacle.y, distance, config_.collision_radius);
+            }
+            
             if (distance < config_.collision_radius) {
+                if (should_log) {
+                    RCLCPP_WARN(rclcpp::get_logger("path_generator"), 
+                        "[COLLISION FOUND] Collision detected! dist=%.3f < threshold=%.3f", 
+                        distance, config_.collision_radius);
+                }
                 return true;  // 충돌 감지 즉시 반환으로 조기 종료
             }
         }
+    }
+    
+    if (should_log) {
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+            "[COLLISION DEBUG] Raceline is SAFE - no collisions found");
     }
     
     return false;  // 전체 경로에서 충돌 없음

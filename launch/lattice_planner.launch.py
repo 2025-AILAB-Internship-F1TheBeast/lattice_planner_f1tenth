@@ -39,7 +39,7 @@ def generate_launch_description():
         remappings=[
             ('/odom', 'ego_racecar/odom'),
             ('/scan', '/scan'),
-            ('/map', '/map'),
+            ('/map', '/dynamic_map'),
         ],
         condition=IfCondition(LaunchConfiguration('sim_mode'))
     )
@@ -57,7 +57,7 @@ def generate_launch_description():
         remappings=[
             ('/odom', '/pf/pose/odom'),
             ('/scan', '/scan'),
-            ('/map', '/map'),
+            ('/map', '/dynamic_map'),
         ],
         condition=UnlessCondition(LaunchConfiguration('sim_mode'))
     )

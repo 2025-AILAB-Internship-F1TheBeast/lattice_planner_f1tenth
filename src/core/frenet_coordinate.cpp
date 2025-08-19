@@ -51,13 +51,17 @@ FrenetPoint FrenetCoordinate::cartesian_to_frenet(const Point2D& cartesian_point
     FrenetPoint frenet_point;
     frenet_point.s = ref_point.s;
     
+    // Calculate lateral distance
+    double raw_d = -dx * sin_theta + dy * cos_theta;  // Lateral distance (left positive)
+    
+    // Debug logging removed for performance
+    
     // If too far from reference path, limit lateral offset
     if (distance > 10.0) {
         // Clamp lateral offset to reasonable range
-        double raw_d = -dx * sin_theta + dy * cos_theta;
         frenet_point.d = std::max(-5.0, std::min(5.0, raw_d));
     } else {
-        frenet_point.d = -dx * sin_theta + dy * cos_theta;  // Lateral distance (left positive)
+        frenet_point.d = raw_d;
     }
     
     return frenet_point;
