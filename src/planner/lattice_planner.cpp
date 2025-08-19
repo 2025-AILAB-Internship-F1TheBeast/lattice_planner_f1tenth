@@ -102,6 +102,24 @@ bool LatticePlanner::initialize() {
     this->declare_parameter("safety_margin", 0.15);
     this->declare_parameter("obstacle_detection_range", 8.0);
     
+    // Declare path selection parameters
+    this->declare_parameter("path_selection.commit_min_progress", 1.0);
+    this->declare_parameter("path_selection.commit_min_time_sec", 0.8);
+    this->declare_parameter("path_selection.commit_cost_improve_ratio", 0.1);
+    this->declare_parameter("path_selection.commit_lateral_change_min", 0.05);
+    this->declare_parameter("path_selection.commit_obstacle_min_progress", 0.8);
+    this->declare_parameter("path_selection.commit_obstacle_min_time_sec", 1.2);
+    this->declare_parameter("path_selection.commit_obstacle_improve_ratio", 0.2);
+    this->declare_parameter("path_selection.detour_return_clear_frames_threshold", 15);
+    this->declare_parameter("path_selection.reference_offset_target", 0.0);
+    this->declare_parameter("path_selection.reference_offset_tolerance", 0.05);
+    this->declare_parameter("path_selection.path_length_commit_mode", true);
+    this->declare_parameter("path_selection.path_length", 2.0);
+    this->declare_parameter("path_selection.obstacle_path_length_multiplier", 2.0);
+    this->declare_parameter("path_selection.cost_difference_threshold", 0.15);
+    this->declare_parameter("path_selection.stability_frame_count", 3);
+    this->declare_parameter("path_selection.lateral_change_penalty", 0.5);
+    
     config_.reference_path_file = this->get_parameter("reference_path_file").as_string();
     config_.path_resolution = this->get_parameter("path_resolution").as_double();
     config_.lateral_step = this->get_parameter("lateral_step").as_double();
@@ -181,19 +199,28 @@ bool LatticePlanner::initialize() {
     
     advanced_obstacle_detector_ = std::make_unique<advanced::ObstacleDetector>(obs_config);
     
-    // 안전한 경로 선택을 위한 향상된 설정
+    // Load path selection configuration from parameters
     advanced::PathSelectionConfig sel_config;
-    sel_config.commit_min_progress = 1.0;
-    sel_config.commit_min_time_sec = 0.8;
+    sel_config.commit_min_progress = this->get_parameter("path_selection.commit_min_progress").as_double();
+    sel_config.commit_min_time_sec = this->get_parameter("path_selection.commit_min_time_sec").as_double();
+    sel_config.commit_cost_improve_ratio = this->get_parameter("path_selection.commit_cost_improve_ratio").as_double();
+    sel_config.commit_lateral_change_min = this->get_parameter("path_selection.commit_lateral_change_min").as_double();
     
-    // 장애물 회피 지속성 강화
-    sel_config.path_length = 2.0;                       // 기본 커밋 길이 증가
-    sel_config.obstacle_path_length_multiplier = 2.0;   // 장애물 상황에서 2배 연장
-    sel_config.path_length_commit_mode = true;          // 경로 길이 기반 커밋 활성화
+    sel_config.commit_obstacle_min_progress = this->get_parameter("path_selection.commit_obstacle_min_progress").as_double();
+    sel_config.commit_obstacle_min_time_sec = this->get_parameter("path_selection.commit_obstacle_min_time_sec").as_double();
+    sel_config.commit_obstacle_improve_ratio = this->get_parameter("path_selection.commit_obstacle_improve_ratio").as_double();
     
-    // 더 안정적인 detour 설정
-    sel_config.detour_return_clear_frames_threshold = 5; // 더 많은 프레임 확인 후 복귀
-    sel_config.reference_offset_tolerance = 0.05;       // raceline 허용 범위 약간 확대
+    sel_config.detour_return_clear_frames_threshold = this->get_parameter("path_selection.detour_return_clear_frames_threshold").as_int();
+    sel_config.reference_offset_target = this->get_parameter("path_selection.reference_offset_target").as_double();
+    sel_config.reference_offset_tolerance = this->get_parameter("path_selection.reference_offset_tolerance").as_double();
+    
+    sel_config.path_length_commit_mode = this->get_parameter("path_selection.path_length_commit_mode").as_bool();
+    sel_config.path_length = this->get_parameter("path_selection.path_length").as_double();
+    sel_config.obstacle_path_length_multiplier = this->get_parameter("path_selection.obstacle_path_length_multiplier").as_double();
+    
+    sel_config.cost_difference_threshold = this->get_parameter("path_selection.cost_difference_threshold").as_double();
+    sel_config.stability_frame_count = this->get_parameter("path_selection.stability_frame_count").as_int();
+    sel_config.lateral_change_penalty = this->get_parameter("path_selection.lateral_change_penalty").as_double();
     
     path_selector_ = std::make_unique<advanced::PathSelector>(sel_config);
     
@@ -224,7 +251,9 @@ bool LatticePlanner::initialize() {
         occupancy_grid_topic, 10,
         std::bind(&LatticePlanner::grid_callback, this, std::placeholders::_1));
     
-    RCLCPP_INFO(this->get_logger(), "Subscribing to occupancy grid topic: %s", occupancy_grid_topic.c_str());
+    RCLCPP_WARN(this->get_logger(), "=== LATTICE PLANNER MAP TOPIC DEBUG ===");
+    RCLCPP_WARN(this->get_logger(), "Config occupancy_grid_topic: %s", occupancy_grid_topic.c_str());
+    RCLCPP_WARN(this->get_logger(), "Subscribing to occupancy grid topic: %s", occupancy_grid_topic.c_str());
     
     // Initialize planning timer
     auto timer_period = std::chrono::milliseconds(static_cast<int>(1000.0 / planning_frequency));
@@ -342,6 +371,10 @@ void LatticePlanner::laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr
 }
 
 void LatticePlanner::grid_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
+        "=== RECEIVED MAP DATA === Topic: %s, Frame: %s, Size: %dx%d", 
+        "via_callback", msg->header.frame_id.c_str(), msg->info.width, msg->info.height);
+    
     if (!odom_received_) return;
     
     // Store the current grid for track boundary detection
