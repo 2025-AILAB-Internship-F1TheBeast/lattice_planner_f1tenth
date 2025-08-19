@@ -365,6 +365,14 @@ void LatticePlanner::laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr
         "[LIDAR] %zu tracked, %zu dynamic obstacles", 
         tracked_obstacles.size(), dynamic_obstacles.size());
     
+    // Check if we have map data - if not, disable obstacle detection for testing
+    if (!current_grid_) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "=== NO MAP DATA - DISABLING LIDAR OBSTACLE DETECTION FOR TESTING ===");
+        current_obstacles_.clear(); // No obstacles when no map for testing
+        return;
+    }
+    
     // Keep old detector for compatibility
     current_obstacles_ = obstacle_detector_->detect_from_laser_scan(
         msg, vehicle_pos, vehicle_yaw);
