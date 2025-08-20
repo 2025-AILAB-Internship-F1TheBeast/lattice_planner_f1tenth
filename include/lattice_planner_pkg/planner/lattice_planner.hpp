@@ -7,6 +7,7 @@
 #include "lattice_planner_pkg/core/spline_utils.hpp"
 #include "lattice_planner_pkg/obstacle_detector.hpp"
 #include "lattice_planner_pkg/path_selector.hpp"
+#include "obstacle_detection_pkg/msg/obstacle_array.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -32,7 +33,6 @@ public:
     
 private:
     // ROS2 Publishers and Subscribers
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
     rclcpp::Publisher<planning_custom_msgs::msg::PathWithVelocity>::SharedPtr path_with_velocity_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr ref_path_pub_;
@@ -40,6 +40,7 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr laser_sub_;
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_sub_;
+    rclcpp::Subscription<obstacle_detection_pkg::msg::ObstacleArray>::SharedPtr obstacle_array_sub_;
     
     rclcpp::TimerBase::SharedPtr planning_timer_;
     rclcpp::TimerBase::SharedPtr ref_path_timer_;
@@ -63,6 +64,7 @@ private:
     
     // Obstacles
     std::vector<Obstacle> current_obstacles_;
+    std::vector<obstacle_detection_pkg::msg::Obstacle> global_obstacles_;
     std::mutex obstacles_mutex_;
     
     // Occupancy Grid for track boundary detection
@@ -88,6 +90,7 @@ private:
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
     void laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg);
     void grid_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
+    void obstacle_array_callback(const obstacle_detection_pkg::msg::ObstacleArray::SharedPtr msg);
     void planning_timer_callback();
     void ref_path_timer_callback();
     

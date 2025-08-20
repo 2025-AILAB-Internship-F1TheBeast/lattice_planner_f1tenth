@@ -168,6 +168,129 @@ std::vector<PathCandidate> PathGenerator::generate_paths(
     return candidates;
 }
 
+std::vector<PathCandidate> PathGenerator::generate_paths_with_global_obstacles(
+    const Point2D& vehicle_position,
+    double vehicle_yaw,
+    double vehicle_velocity,
+    const std::vector<obstacle_detection_pkg::msg::Obstacle>& global_obstacles) {
+    
+    std::vector<PathCandidate> candidates;
+    
+    if (!frenet_coord_) {
+        return candidates;
+    }
+    
+    // Convert vehicle position to Frenet coordinates
+    FrenetPoint start_frenet = frenet_coord_->cartesian_to_frenet(vehicle_position);
+    
+    // Get reference point at current s position to align with vehicle heading
+    RefPoint ref_point = frenet_coord_->get_reference_point(start_frenet.s);
+    double ref_heading = ref_point.heading;
+    
+    // Calculate heading difference between vehicle and reference path
+    double heading_diff = vehicle_yaw - ref_heading;
+    while (heading_diff > M_PI) heading_diff -= 2.0 * M_PI;
+    while (heading_diff < -M_PI) heading_diff += 2.0 * M_PI;
+    
+    // If vehicle heading is significantly different from reference path, 
+    // adjust the starting frenet coordinates to ensure smooth transition
+    if (std::abs(heading_diff) > M_PI/6) {  // More than 30 degrees difference
+        // Project vehicle's forward direction onto frenet frame
+        double forward_s_component = vehicle_velocity * std::cos(heading_diff);
+        double forward_d_component = vehicle_velocity * std::sin(heading_diff);
+        
+        // Initialize starting derivatives based on vehicle's actual motion
+        start_frenet.d_dot = forward_d_component;
+        start_frenet.s_dot = std::max(forward_s_component, 0.5); // Minimum forward motion
+    } else {
+        // Vehicle aligned with reference path, use standard derivatives
+        start_frenet.d_dot = 0.0;
+        start_frenet.s_dot = vehicle_velocity;
+    }
+    
+    start_frenet.d_ddot = 0.0;
+    start_frenet.s_ddot = 0.0;
+    
+    // Generate samples with dynamic horizon based on vehicle speed
+    std::vector<double> time_samples = generate_time_samples_dynamic(vehicle_velocity);
+    std::vector<double> lateral_samples = generate_lateral_samples(start_frenet.d);
+    
+    // Filter out lateral samples that would result in out-of-track paths
+    std::vector<double> valid_lateral_samples;
+    for (double lateral_offset : lateral_samples) {
+        if (is_within_track_bounds(lateral_offset, start_frenet.s)) {
+            valid_lateral_samples.push_back(lateral_offset);
+        }
+    }
+    
+    // Use valid samples, fallback to original if all are filtered out
+    if (!valid_lateral_samples.empty()) {
+        lateral_samples = valid_lateral_samples;
+    }
+    
+    // Disable speed sampling: use a single target velocity (clamped to limits)
+    double clamped_velocity = std::max(1.0, // minimum 1 m/s 
+                                     std::min(config_.max_velocity, vehicle_velocity));
+    std::vector<double> velocity_samples = {clamped_velocity};
+    
+    // Tracking variables for debugging
+    static int generation_count = 0;
+    bool should_log = (generation_count % 200 == 0); // Log every 200 generations (reduced from 50)
+    
+    // Generate paths for each combination
+    for (double time_horizon : time_samples) {
+        for (double lateral_offset : lateral_samples) {
+            for (double target_velocity : velocity_samples) {
+                PathCandidate candidate = generate_single_path(
+                    start_frenet, lateral_offset, target_velocity);
+                
+                if (candidate.points.empty()) continue;
+                
+                // Enhanced boundary checking for multiple points along path
+                std::vector<size_t> check_indices;
+                if (candidate.points.size() <= 5) {
+                    // Small path: check all points
+                    for (size_t i = 0; i < candidate.points.size(); ++i) {
+                        check_indices.push_back(i);
+                    }
+                } else {
+                    // Large path: check strategic points (start, middle, end)
+                    check_indices = {0, candidate.points.size()/4, candidate.points.size()/2, 
+                                   3*candidate.points.size()/4, candidate.points.size()-1};
+                }
+                
+                // Check track boundaries at multiple points
+                for (size_t idx : check_indices) {
+                    const auto& point = candidate.points[idx];
+                    // Convert cartesian point back to frenet to get s position
+                    FrenetPoint frenet_point = frenet_coord_->cartesian_to_frenet(Point2D(point.x, point.y));
+                    
+                    if (!is_within_track_bounds(frenet_point.d, frenet_point.s)) {
+                        candidate.out_of_track = true;
+                        if (should_log) {
+                            RCLCPP_WARN(rclcpp::get_logger("path_generator"), 
+                                "Path OUT_OF_TRACK: offset=%.3f at point %zu", lateral_offset, idx);
+                        }
+                        break;
+                    }
+                }
+                
+                // Calculate cost and check collision with global obstacles
+                // Note: We don't have a cost function that takes global obstacles, so we'll use empty obstacles for cost
+                std::vector<Obstacle> empty_obstacles;
+                candidate.cost = calculate_path_cost(candidate, empty_obstacles);
+                candidate.is_safe = !check_collision_with_global_obstacles(candidate, global_obstacles);
+                
+                // Add all paths to candidates (let path selector decide what to do)
+                candidates.push_back(candidate);
+            }
+        }
+    }
+    
+    generation_count++;
+    return candidates;
+}
+
 PathCandidate PathGenerator::generate_single_path(
     const FrenetPoint& start_frenet,
     double target_lateral_offset,
@@ -341,35 +464,37 @@ PathCandidate PathGenerator::generate_single_path(
 std::vector<double> PathGenerator::generate_time_samples() const {
     std::vector<double> samples;
     
-    // 차량 현재 위치에서 바로 분기: 매우 짧은 간격으로 조밀하게 샘플링
+    // 단순화된 시간 샘플링 (성능 개선)
     samples.push_back(0.0);  // 현재 위치
     
-    // 더 강화된 즉시 분기를 위한 극도로 조밀한 초기 샘플링
-    double ultra_fine_dt = 0.01;  // 10ms 간격 (더 세밀)
-    double ultra_fine_horizon = 0.1;  // 첫 100ms에 집중
-    int ultra_fine_samples = static_cast<int>(ultra_fine_horizon / ultra_fine_dt);
+    // 더 적은 샘플로 단순화
+    double dt = 0.2;  // 200ms 간격 (기존보다 훨씬 큰 간격)
+    int num_samples = static_cast<int>(config_.planning_horizon / dt);
     
-    for (int i = 1; i <= ultra_fine_samples; ++i) {
-        samples.push_back(i * ultra_fine_dt);
+    for (int i = 1; i <= num_samples; ++i) {
+        samples.push_back(i * dt);
     }
     
-    // 초기 전환 구간 (0.1~0.3초)
-    double early_dt = 0.02;  // 20ms 간격
-    double early_horizon = 0.3;
-    double early_start = ultra_fine_horizon;
-    int early_samples = static_cast<int>((early_horizon - early_start) / early_dt);
+    return samples;
+}
+
+std::vector<double> PathGenerator::generate_time_samples_dynamic(double vehicle_velocity) const {
+    std::vector<double> samples;
     
-    for (int i = 1; i <= early_samples; ++i) {
-        samples.push_back(early_start + i * early_dt);
-    }
+    // 동적 시간 샘플링 (속도 기반)
+    samples.push_back(0.0);  // 현재 위치
     
-    // 나머지 구간은 기존 간격으로
-    double remaining_horizon = config_.planning_horizon - early_horizon;
-    double normal_dt = config_.dt / 2.0;  // 0.05초 간격
-    int remaining_samples = static_cast<int>(remaining_horizon / normal_dt);
+    // 속도에 따른 동적 horizon 계산
+    double dynamic_horizon = calculate_dynamic_horizon(vehicle_velocity);
     
-    for (int i = 1; i <= remaining_samples; ++i) {
-        samples.push_back(early_horizon + i * normal_dt);
+    double dt = 1.0;  // 1000ms 간격 (극한 성능 개선: 0.5 -> 1.0)
+    int num_samples = static_cast<int>(dynamic_horizon / dt);
+    
+    // 최소 2개, 최대 4개 샘플로 제한 (성능 우선)
+    num_samples = std::clamp(num_samples, 2, 4);
+    
+    for (int i = 1; i <= num_samples; ++i) {
+        samples.push_back(i * dt);
     }
     
     return samples;
@@ -387,23 +512,12 @@ bool PathGenerator::is_within_track_bounds(double lateral_offset, double s_posit
     // width_left = distance from centerline to left boundary (positive)
     // width_right = distance from centerline to right boundary (positive)
     // So valid d range is [-width_right, +width_left]
-    double generous_margin = 0.3;  // 30cm extra margin
-    double left_bound = ref_point.width_left + generous_margin;   // positive limit
-    double right_bound = ref_point.width_right + generous_margin; // negative limit (magnitude)
+    double safety_margin = 0.15;  // 30cm 안전 여백
+    double left_bound = -ref_point.width_left + safety_margin;       // 왼쪽: -width_left + margin (경계 안쪽으로)
+    double right_bound = ref_point.width_right - safety_margin;      // 오른쪽: +width_right - margin (경계 안쪽으로)
     
-    // Correct bounds check: d should be in [-right_bound, +left_bound]
-    bool within_bounds = (lateral_offset >= -right_bound && lateral_offset <= left_bound);
-    
-    // Only log occasionally to avoid spam
-    static int log_count = 0;
-    if (log_count < 10 || log_count % 100 == 0) {
-        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
-            "Track bounds check [%d]: d=%.3f, bounds=[%.2f, %.2f], result=%s", 
-            log_count, lateral_offset, -right_bound, left_bound, 
-            within_bounds ? "PASS" : "FAIL");
-    }
-    log_count++;
-    
+    // 차량 offset이 경계 안에 있는지 확인: right_bound <= lateral_offset <= left_bound
+    bool within_bounds = (lateral_offset >= left_bound && lateral_offset <= right_bound);
     return within_bounds;
 }
 
@@ -508,7 +622,7 @@ std::vector<double> PathGenerator::generate_velocity_samples(double current_velo
     // Log velocity sampling for debugging
     static int vel_log_count = 0;
     if (vel_log_count < 5) {
-        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"),
             "[VELOCITY SAMPLES] current=%.1f, s=%.1f, range=[%.1f, %.1f], samples=%d", 
             current_velocity, current_s, min_vel, max_vel, num_samples);
         vel_log_count++;
@@ -531,7 +645,15 @@ double PathGenerator::calculate_path_cost(
     double lateral_cost_normalized = std::abs(path.lateral_offset) / config_.max_lateral_offset;
     lateral_cost_normalized = std::min(1.0, lateral_cost_normalized);
     
-    // 2. 장애물 관련 비용 (FORWARD LOOK-AHEAD 시스템)
+    // 2. 곡률 비용 (0-1 정규화)
+    double curvature_cost_normalized = 0.0;
+    double max_curvature_in_path = 0.0;
+    for (const auto& point : path.points) {
+        max_curvature_in_path = std::max(max_curvature_in_path, std::abs(point.curvature));
+    }
+    curvature_cost_normalized = std::min(1.0, max_curvature_in_path / config_.max_curvature);
+    
+    // 3. 장애물 관련 비용 (FORWARD LOOK-AHEAD 시스템)
     double obstacle_cost_normalized = 0.0;
     if (!obstacles.empty()) {
         double max_obstacle_cost = 0.0;
@@ -592,14 +714,15 @@ double PathGenerator::calculate_path_cost(
         }
     }
     
-    // === 가중치 합을 통한 최종 비용 계산 (곡률 제외) ===
+    // === 가중치 합을 통한 최종 비용 계산 (순서대로 정리) ===
     
     // 1. 개별 비용 계산 (가중치 적용)
     double weighted_lateral_cost = lateral_cost_normalized * config_.lateral_cost_weight;
+    double weighted_curvature_cost = curvature_cost_normalized * config_.curvature_cost_weight;
     double weighted_obstacle_cost = obstacle_cost_normalized * config_.obstacle_cost_weight;
     
-    // 2. 총 비용 합계 (곡률 비용 제외)
-    double total_cost = weighted_lateral_cost + weighted_obstacle_cost;
+    // 2. 총 비용 합계
+    double total_cost = weighted_lateral_cost + weighted_curvature_cost + weighted_obstacle_cost;
     
     // 3. 레이스라인 보너스 적용
     double raceline_bonus = 1.0;
@@ -610,18 +733,20 @@ double PathGenerator::calculate_path_cost(
     // 4. 최종 비용
     double final_cost = total_cost * raceline_bonus;
     
-    // Debug: 비용 구성 요소별 상세 로깅 (곡률 제외)
+    // Debug: 비용 구성 요소별 상세 로깅 (순서대로)
     static int cost_log_count = 0;
     if (cost_log_count < 5) {
         RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
             "[COST BREAKDOWN] offset=%.3f:\n"
             "  1. Lateral:   norm=%.3f * weight=%.1f = %.3f\n"
-            "  2. Obstacle:  norm=%.3f * weight=%.1f = %.3f\n"
-            "  3. Total:     %.3f\n"
-            "  4. Raceline:  bonus=%.1f\n"
-            "  5. Final:     %.3f %s", 
+            "  2. Curvature: norm=%.3f * weight=%.2f = %.3f\n"
+            "  3. Obstacle:  norm=%.3f * weight=%.1f = %.3f\n"
+            "  4. Total:     %.3f\n"
+            "  5. Raceline:  bonus=%.1f\n"
+            "  6. Final:     %.3f %s", 
             path.lateral_offset,
             lateral_cost_normalized, config_.lateral_cost_weight, weighted_lateral_cost,
+            curvature_cost_normalized, config_.curvature_cost_weight, weighted_curvature_cost,
             obstacle_cost_normalized, config_.obstacle_cost_weight, weighted_obstacle_cost,
             total_cost,
             raceline_bonus,
@@ -689,6 +814,64 @@ bool PathGenerator::check_collision(
     return false;  // 전체 경로에서 충돌 없음
 }
 
+bool PathGenerator::check_collision_with_global_obstacles(
+    const PathCandidate& path,
+    const std::vector<obstacle_detection_pkg::msg::Obstacle>& global_obstacles) {
+    
+    // If no obstacles, path is safe
+    if (global_obstacles.empty()) {
+        return false;
+    }
+    
+    if (path.points.empty()) {
+        return true;  // Empty path is considered unsafe
+    }
+    
+    // Debug: raceline 경로에 대해 주기적으로 로깅 (매우 드물게)
+    static int log_counter = 0;
+    bool should_log = false; // 로깅 비활성화
+    
+    if (should_log) {
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+            "[GLOBAL COLLISION DEBUG] Checking raceline with %zu global obstacles", 
+            global_obstacles.size());
+    }
+    
+    // Check collision with global obstacles
+    for (const auto& point : path.points) {
+        for (const auto& obstacle : global_obstacles) {
+            double dx = point.x - obstacle.position.x;
+            double dy = point.y - obstacle.position.y;
+            double distance = std::sqrt(dx*dx + dy*dy);
+            
+            // Use obstacle size as collision radius (already expanded by 0.2m in callback)
+            double collision_radius = obstacle.size / 2.0;  // Use radius instead of diameter
+            
+            if (should_log && distance < 2.0) { // 2m 이내 장애물만 로깅
+                RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+                    "[GLOBAL COLLISION DEBUG] Point(%.2f,%.2f) vs Obstacle(%.2f,%.2f): dist=%.3f (threshold=%.3f)", 
+                    point.x, point.y, obstacle.position.x, obstacle.position.y, distance, collision_radius);
+            }
+            
+            if (distance < collision_radius) {
+                if (should_log) {
+                    RCLCPP_WARN(rclcpp::get_logger("path_generator"), 
+                        "[GLOBAL COLLISION FOUND] Collision detected! dist=%.3f < threshold=%.3f", 
+                        distance, collision_radius);
+                }
+                return true;  // 충돌 감지 즉시 반환으로 조기 종료
+            }
+        }
+    }
+    
+    if (should_log) {
+        RCLCPP_INFO(rclcpp::get_logger("path_generator"), 
+            "[GLOBAL COLLISION DEBUG] Raceline is SAFE - no collisions found");
+    }
+    
+    return false;  // 전체 경로에서 충돌 없음
+}
+
 std::vector<double> PathGenerator::solve_quintic_polynomial(
     double start_pos, double start_vel, double start_acc,
     double end_pos, double end_vel, double end_acc,
@@ -736,6 +919,20 @@ std::vector<double> PathGenerator::solve_quartic_polynomial(
     coeffs[3] = (end_vel - start_vel - start_acc * T) / (T * T);
     
     return coeffs;
+}
+
+double PathGenerator::calculate_dynamic_horizon(double vehicle_velocity) const {
+    // 거리 기반으로 변경: 항상 10미터 경로 길이 유지
+    double target_distance = 10.0;  // 10미터 고정
+    double min_time = 1.5;  // 최소 1.5초
+    double max_time = 4.0;  // 최대 4초
+    
+    if (vehicle_velocity <= 0.5) {
+        return max_time;  // 거의 정지 상태
+    }
+    
+    double calculated_time = target_distance / vehicle_velocity;
+    return std::clamp(calculated_time, min_time, max_time);
 }
 
 } // namespace lattice_planner_pkg

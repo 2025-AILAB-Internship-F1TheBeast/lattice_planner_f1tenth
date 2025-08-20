@@ -3,6 +3,7 @@
 #include "planning_custom_msgs/msg/path_with_velocity.hpp"
 #include "lattice_planner_pkg/obstacle_detector.hpp"
 #include "lattice_planner_pkg/path_selector.hpp"
+#include "obstacle_detection_pkg/msg/obstacle_array.hpp"
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <algorithm>
@@ -181,19 +182,9 @@ bool LatticePlanner::initialize() {
     
     advanced_obstacle_detector_ = std::make_unique<advanced::ObstacleDetector>(obs_config);
     
-    // 안전한 경로 선택을 위한 향상된 설정
+    // 단순화된 경로 선택 설정
     advanced::PathSelectionConfig sel_config;
-    sel_config.commit_min_progress = 1.0;
-    sel_config.commit_min_time_sec = 0.8;
-    
-    // 장애물 회피 지속성 강화
-    sel_config.path_length = 2.0;                       // 기본 커밋 길이 증가
-    sel_config.obstacle_path_length_multiplier = 2.0;   // 장애물 상황에서 2배 연장
-    sel_config.path_length_commit_mode = true;          // 경로 길이 기반 커밋 활성화
-    
-    // 더 안정적인 detour 설정
-    sel_config.detour_return_clear_frames_threshold = 5; // 더 많은 프레임 확인 후 복귀
-    sel_config.reference_offset_tolerance = 0.05;       // raceline 허용 범위 약간 확대
+    sel_config.path_length = 3.0;  // 3m 커밋 길이
     
     path_selector_ = std::make_unique<advanced::PathSelector>(sel_config);
     
@@ -201,8 +192,6 @@ bool LatticePlanner::initialize() {
     obstacle_detector_ = std::make_shared<ObstacleDetector>(config_);
     
     // Initialize publishers
-    path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
-        "/planned_path", 10);
     path_with_velocity_pub_ = this->create_publisher<planning_custom_msgs::msg::PathWithVelocity>(
         "/planned_path_with_velocity", 10);
     marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -225,6 +214,12 @@ bool LatticePlanner::initialize() {
         std::bind(&LatticePlanner::grid_callback, this, std::placeholders::_1));
     
     RCLCPP_INFO(this->get_logger(), "Subscribing to occupancy grid topic: %s", occupancy_grid_topic.c_str());
+    
+    obstacle_array_sub_ = this->create_subscription<obstacle_detection_pkg::msg::ObstacleArray>(
+        "/obstacles", 10,
+        std::bind(&LatticePlanner::obstacle_array_callback, this, std::placeholders::_1));
+    
+    RCLCPP_INFO(this->get_logger(), "Subscribing to obstacle array topic: /obstacles");
     
     // Initialize planning timer
     auto timer_period = std::chrono::milliseconds(static_cast<int>(1000.0 / planning_frequency));
@@ -396,6 +391,32 @@ void LatticePlanner::grid_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr
     }
 }
 
+void LatticePlanner::obstacle_array_callback(const obstacle_detection_pkg::msg::ObstacleArray::SharedPtr msg) {
+    if (!odom_received_) return;
+    
+    std::lock_guard<std::mutex> lock(obstacles_mutex_);
+    
+    // Store global obstacles with increased size for safety margin
+    global_obstacles_.clear();
+    for (const auto& obs : msg->obstacles) {
+        obstacle_detection_pkg::msg::Obstacle expanded_obs = obs;
+        expanded_obs.size += 0.2;  // Add 0.2m safety margin as requested
+        global_obstacles_.push_back(expanded_obs);
+    }
+    
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "[GLOBAL OBSTACLES] Received %d obstacles with 0.2m safety margin", 
+        (int)global_obstacles_.size());
+        
+    if (!global_obstacles_.empty()) {
+        for (const auto& obs : global_obstacles_) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "[OBSTACLE] Position: (%.2f, %.2f), Size: %.2fm", 
+                obs.position.x, obs.position.y, obs.size);
+        }
+    }
+}
+
 void LatticePlanner::planning_timer_callback() {
     if (!odom_received_) {
         return; // Skip planning until odometry is available
@@ -410,7 +431,7 @@ void LatticePlanner::plan_paths() {
     Point2D vehicle_pos;
     double vehicle_yaw;
     double vehicle_vel;
-    std::vector<Obstacle> obstacles;
+    std::vector<obstacle_detection_pkg::msg::Obstacle> global_obstacles;
     
     {
         std::lock_guard<std::mutex> state_lock(vehicle_state_mutex_);
@@ -421,14 +442,14 @@ void LatticePlanner::plan_paths() {
     
     {
         std::lock_guard<std::mutex> obs_lock(obstacles_mutex_);
-        obstacles = current_obstacles_;
+        global_obstacles = global_obstacles_;
     }
     
-    // Generate path candidates
+    // Generate path candidates using global obstacles
     auto gen_start = std::chrono::high_resolution_clock::now();
-    RCLCPP_INFO(this->get_logger(), "[OBSTACLE DEBUG] Using %zu obstacles for path generation", obstacles.size());
-    std::vector<PathCandidate> candidates = path_generator_->generate_paths(
-        vehicle_pos, vehicle_yaw, vehicle_vel, obstacles);
+    RCLCPP_INFO(this->get_logger(), "[GLOBAL OBSTACLE DEBUG] Using %zu global obstacles for path generation", global_obstacles.size());
+    std::vector<PathCandidate> candidates = path_generator_->generate_paths_with_global_obstacles(
+        vehicle_pos, vehicle_yaw, vehicle_vel, global_obstacles);
     auto gen_end = std::chrono::high_resolution_clock::now();
     auto gen_duration = std::chrono::duration_cast<std::chrono::microseconds>(gen_end - gen_start);
     
@@ -512,11 +533,11 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
             double base_obstacle_cost = advanced_obstacle_detector_->calculateOccupancyCost(result.path_points);
             result.cost += base_obstacle_cost;
             
-            // 상세 로깅
-            RCLCPP_INFO(this->get_logger(), "[PATH CHECK] Path %zu: offset=%.3f, basic_safe=%s, obstacle_cost=%.3f", 
-                       i, candidate.lateral_offset, 
-                       candidate.is_safe ? "YES" : "NO",
-                       base_obstacle_cost);
+            // Reduced logging for performance
+            // RCLCPP_INFO(this->get_logger(), "[PATH CHECK] Path %zu: offset=%.3f, basic_safe=%s, obstacle_cost=%.3f", 
+            //            i, candidate.lateral_offset, 
+            //            candidate.is_safe ? "YES" : "NO",
+            //            base_obstacle_cost);
         }
         
         advanced_candidates.push_back(result);
@@ -527,7 +548,7 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
     size_t best_idx = 0;
     bool found_safe_path = false;
     
-    RCLCPP_WARN(this->get_logger(), "[PATH SELECTION] Starting with %zu candidates", candidates.size());
+    // RCLCPP_WARN(this->get_logger(), "[PATH SELECTION] Starting with %zu candidates", candidates.size());
     
     // 1단계: 진짜 안전한 경로들만 필터링 (기본 + 고급 collision 모두 체크)
     std::vector<size_t> safe_indices;
@@ -535,11 +556,11 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
         // 이중 안전성 체크: 기본 is_safe AND advanced collision detection
         bool is_really_safe = candidates[i].is_safe && !advanced_candidates[i].collided;
         
-        RCLCPP_WARN(this->get_logger(), "[PATH %zu] offset=%.3f, cost=%.3f, basic_safe=%s, adv_collided=%s -> %s", 
-                   i, candidates[i].lateral_offset, advanced_candidates[i].cost, 
-                   candidates[i].is_safe ? "YES" : "NO", 
-                   advanced_candidates[i].collided ? "YES" : "NO",
-                   is_really_safe ? "REALLY_SAFE" : "UNSAFE");
+        // RCLCPP_WARN(this->get_logger(), "[PATH %zu] offset=%.3f, cost=%.3f, basic_safe=%s, adv_collided=%s -> %s", 
+        //            i, candidates[i].lateral_offset, advanced_candidates[i].cost, 
+        //            candidates[i].is_safe ? "YES" : "NO", 
+        //            advanced_candidates[i].collided ? "YES" : "NO",
+        //            is_really_safe ? "REALLY_SAFE" : "UNSAFE");
         
         if (is_really_safe) {
             safe_indices.push_back(i);
@@ -570,7 +591,7 @@ PathCandidate LatticePlanner::select_best_path(const std::vector<PathCandidate>&
                     best_idx = idx;
                     found_safe_path = true;
                     found_raceline = true;
-                    RCLCPP_WARN(this->get_logger(), "[SAFE RACELINE] Path %zu with offset %.3f", idx, candidates[idx].lateral_offset);
+                    // RCLCPP_WARN(this->get_logger(), "[SAFE RACELINE] Path %zu with offset %.3f", idx, candidates[idx].lateral_offset);
                     break;
                 } else {
                     RCLCPP_ERROR(this->get_logger(), "[UNSAFE RACELINE] Skipping raceline due to collision risk!");
@@ -721,39 +742,25 @@ void LatticePlanner::publish_selected_path(const PathCandidate& path) {
         }
     }
 
-    RCLCPP_ERROR(this->get_logger(), "[PUBLISH START] Publishing path with %zu points (trimmed from %zu), lateral_offset=%.3f", 
-                trimmed.points.size(), path.points.size(), path.lateral_offset);
-    
-    // Publish path as nav_msgs::Path (for path_follower)
-    auto nav_path = convert_to_nav_path(trimmed);
-    path_pub_->publish(nav_path);
+    // RCLCPP_ERROR(this->get_logger(), "[PUBLISH START] Publishing path with %zu points (trimmed from %zu), lateral_offset=%.3f", 
+    //            trimmed.points.size(), path.points.size(), path.lateral_offset);
     
     // Publish path as PathWithVelocity (for velocity-aware control)
     auto velocity_path = convert_to_path_with_velocity(trimmed);
     path_with_velocity_pub_->publish(velocity_path);
     
     // 첫 번째와 마지막 점 로깅
-    if (nav_path.poses.size() >= 2) {
-        const auto& first = nav_path.poses.front();
-        const auto& last = nav_path.poses.back();
-        RCLCPP_ERROR(this->get_logger(), 
-            "[PUBLISH DETAILS] nav_path: %zu points, first=(%.2f,%.2f), last=(%.2f,%.2f)",
-            nav_path.poses.size(), 
-            first.pose.position.x, first.pose.position.y,
-            last.pose.position.x, last.pose.position.y);
-    }
-    
     if (velocity_path.points.size() >= 2) {
         const auto& first_vel = velocity_path.points.front();
         const auto& last_vel = velocity_path.points.back();
-        RCLCPP_ERROR(this->get_logger(), 
-            "[PUBLISH DETAILS] velocity_path: %zu points, first=(%.2f,%.2f,v=%.2f), last=(%.2f,%.2f,v=%.2f)",
-            velocity_path.points.size(), 
-            first_vel.x, first_vel.y, first_vel.velocity,
-            last_vel.x, last_vel.y, last_vel.velocity);
+        // RCLCPP_ERROR(this->get_logger(), 
+        //     "[PUBLISH DETAILS] velocity_path: %zu points, first=(%.2f,%.2f,v=%.2f), last=(%.2f,%.2f,v=%.2f)",
+        //     velocity_path.points.size(), 
+        //     first_vel.x, first_vel.y, first_vel.velocity,
+        //     last_vel.x, last_vel.y, last_vel.velocity);
     }
     
-    RCLCPP_ERROR(this->get_logger(), "[PUBLISH SUCCESS] Both topics published successfully!");
+    // RCLCPP_ERROR(this->get_logger(), "[PUBLISH SUCCESS] PathWithVelocity published successfully!");
 }
 
 void LatticePlanner::publish_path_visualization(
@@ -792,27 +799,6 @@ void LatticePlanner::ref_path_timer_callback() {
 }
 
 
-nav_msgs::msg::Path LatticePlanner::convert_to_nav_path(const PathCandidate& path) {
-    nav_msgs::msg::Path nav_path;
-    nav_path.header.frame_id = "map";
-    nav_path.header.stamp = this->get_clock()->now();
-    
-    for (const auto& point : path.points) {
-        geometry_msgs::msg::PoseStamped pose;
-        pose.header = nav_path.header;
-        pose.pose.position.x = point.x;
-        pose.pose.position.y = point.y;
-        pose.pose.position.z = 0.0;
-        
-        tf2::Quaternion q;
-        q.setRPY(0, 0, point.yaw);
-        tf2::convert(q, pose.pose.orientation);
-        
-        nav_path.poses.push_back(pose);
-    }
-    
-    return nav_path;
-}
 
 planning_custom_msgs::msg::PathWithVelocity LatticePlanner::convert_to_path_with_velocity(const PathCandidate& path) {
     planning_custom_msgs::msg::PathWithVelocity velocity_path;

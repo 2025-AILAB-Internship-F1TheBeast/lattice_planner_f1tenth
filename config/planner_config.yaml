@@ -8,12 +8,12 @@ lattice_planner:
     reference_path_file: "slamtoolbox_raceline"
     path_resolution: 0.1
     
-    # Planning parameters (최적화: 샘플링 개수 감소)
-    lateral_step: 0.3           # Lateral sampling step (m) - 증가로 샘플 개수 감소
-    max_lateral_offset: 1.2     # Maximum lateral offset (m) - 감소로 범위 축소
-    planning_horizon: 1.0       # Planning time horizon (s)
-    dt: 0.1                     # Time step (s) - reduced for smoother paths and faster updates
-    planning_frequency: 40.0    # Planning frequency (Hz) - further increased for reactive corner handling
+    # Planning parameters (극한 최적화: 더 적은 샘플링)
+    lateral_step: 0.4           # Lateral sampling step (m) - 극한 감소로 성능 향상
+    max_lateral_offset: 1.0     # Maximum lateral offset (m) - 더 감소
+    planning_horizon: 3.0       # Planning time horizon (s) - increased for longer paths
+    dt: 0.2                     # Time step (s) - 증가로 더 적은 시간 샘플
+    planning_frequency: 50.0    # Planning frequency (Hz) - increased for better responsiveness
     
     # Vehicle parameters
     max_velocity: 5.0          # Maximum velocity (m/s)
@@ -21,8 +21,8 @@ lattice_planner:
     max_curvature: 1.0          # Maximum path curvature (1/m)
     
     # Cost weights (곡률 비용 제거)
-    obstacle_cost_weight: 10.0
-    lateral_cost_weight: 5.0  # Maximum lateral cost weight for extreme raceline preference
+    obstacle_cost_weight: 15.0  # 장애물 회피 우선순위 강화
+    lateral_cost_weight: 3.0    # 레이스라인 선호도 약간 감소 (안정성 향상)
     curvature_cost_weight: 0.0  # 곡률 비용 완전 제거 - 차량 흔들림 방지
     longitudinal_cost_weight: 0.02  # Further reduced for speed prioritization
     

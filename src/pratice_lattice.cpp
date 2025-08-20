@@ -6,6 +6,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <algorithm>
+#include <chrono>
 
 // Local helpers for inflated occupancy checks used by planner and visualization
 namespace {
@@ -180,19 +181,9 @@ bool LatticePlanner::initialize() {
     
     advanced_obstacle_detector_ = std::make_unique<advanced::ObstacleDetector>(obs_config);
     
-    // 안전한 경로 선택을 위한 향상된 설정
+    // 단순화된 경로 선택 설정
     advanced::PathSelectionConfig sel_config;
-    sel_config.commit_min_progress = 1.0;
-    sel_config.commit_min_time_sec = 0.8;
-    
-    // 장애물 회피 지속성 강화
-    sel_config.path_length = 2.0;                       // 기본 커밋 길이 증가
-    sel_config.obstacle_path_length_multiplier = 2.0;   // 장애물 상황에서 2배 연장
-    sel_config.path_length_commit_mode = true;          // 경로 길이 기반 커밋 활성화
-    
-    // 더 안정적인 detour 설정
-    sel_config.detour_return_clear_frames_threshold = 5; // 더 많은 프레임 확인 후 복귀
-    sel_config.reference_offset_tolerance = 0.05;       // raceline 허용 범위 약간 확대
+    sel_config.path_length = 3.0;  // 3m 커밋 길이
     
     path_selector_ = std::make_unique<advanced::PathSelector>(sel_config);
     
@@ -200,8 +191,6 @@ bool LatticePlanner::initialize() {
     obstacle_detector_ = std::make_shared<ObstacleDetector>(config_);
     
     // Initialize publishers
-    path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
-        "/planned_path", 10);
     path_with_velocity_pub_ = this->create_publisher<planning_custom_msgs::msg::PathWithVelocity>(
         "/planned_path_with_velocity", 10);
     marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -284,6 +273,8 @@ bool LatticePlanner::load_reference_path() {
 }
 
 void LatticePlanner::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    auto start = std::chrono::high_resolution_clock::now();
+    
     std::lock_guard<std::mutex> lock(vehicle_state_mutex_);
     
     vehicle_position_.x = msg->pose.pose.position.x;
@@ -302,6 +293,15 @@ void LatticePlanner::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
     vehicle_velocity_ = std::sqrt(vx*vx + vy*vy);
     
     odom_received_ = true;
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    
+    // Log every 100 calls to avoid spam
+    static int odom_counter = 0;
+    if (++odom_counter % 100 == 0) {
+        RCLCPP_INFO(this->get_logger(), "[ODOM TIMING] Processing time: %.3fms", duration.count() / 1000.0);
+    }
 }
 
 void LatticePlanner::laser_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
@@ -393,6 +393,8 @@ void LatticePlanner::planning_timer_callback() {
 }
 
 void LatticePlanner::plan_paths() {
+    auto total_start = std::chrono::high_resolution_clock::now();
+    
     Point2D vehicle_pos;
     double vehicle_yaw;
     double vehicle_vel;
@@ -411,9 +413,12 @@ void LatticePlanner::plan_paths() {
     }
     
     // Generate path candidates
+    auto gen_start = std::chrono::high_resolution_clock::now();
     RCLCPP_INFO(this->get_logger(), "[OBSTACLE DEBUG] Using %zu obstacles for path generation", obstacles.size());
     std::vector<PathCandidate> candidates = path_generator_->generate_paths(
         vehicle_pos, vehicle_yaw, vehicle_vel, obstacles);
+    auto gen_end = std::chrono::high_resolution_clock::now();
+    auto gen_duration = std::chrono::duration_cast<std::chrono::microseconds>(gen_end - gen_start);
     
     if (candidates.empty()) {
         RCLCPP_WARN(this->get_logger(), "No valid path candidates generated");
@@ -422,10 +427,24 @@ void LatticePlanner::plan_paths() {
     
     
     // Select best path
+    auto select_start = std::chrono::high_resolution_clock::now();
     PathCandidate selected_path = select_best_path(candidates);
+    auto select_end = std::chrono::high_resolution_clock::now();
+    auto select_duration = std::chrono::duration_cast<std::chrono::microseconds>(select_end - select_start);
     
     // Publish selected path
+    auto publish_start = std::chrono::high_resolution_clock::now();
     publish_selected_path(selected_path);
+    auto publish_end = std::chrono::high_resolution_clock::now();
+    auto publish_duration = std::chrono::duration_cast<std::chrono::microseconds>(publish_end - publish_start);
+    
+    auto total_end = std::chrono::high_resolution_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(total_end - total_start);
+    
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "[TIMING] Total: %.3fms | Generation: %.3fms | Selection: %.3fms | Publish: %.3fms", 
+        total_duration.count() / 1000.0, gen_duration.count() / 1000.0, 
+        select_duration.count() / 1000.0, publish_duration.count() / 1000.0);
 
      // Debug: Log selected path info
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
@@ -693,25 +712,11 @@ void LatticePlanner::publish_selected_path(const PathCandidate& path) {
     RCLCPP_ERROR(this->get_logger(), "[PUBLISH START] Publishing path with %zu points (trimmed from %zu), lateral_offset=%.3f", 
                 trimmed.points.size(), path.points.size(), path.lateral_offset);
     
-    // Publish path as nav_msgs::Path (for path_follower)
-    auto nav_path = convert_to_nav_path(trimmed);
-    path_pub_->publish(nav_path);
-    
     // Publish path as PathWithVelocity (for velocity-aware control)
     auto velocity_path = convert_to_path_with_velocity(trimmed);
     path_with_velocity_pub_->publish(velocity_path);
     
     // 첫 번째와 마지막 점 로깅
-    if (nav_path.poses.size() >= 2) {
-        const auto& first = nav_path.poses.front();
-        const auto& last = nav_path.poses.back();
-        RCLCPP_ERROR(this->get_logger(), 
-            "[PUBLISH DETAILS] nav_path: %zu points, first=(%.2f,%.2f), last=(%.2f,%.2f)",
-            nav_path.poses.size(), 
-            first.pose.position.x, first.pose.position.y,
-            last.pose.position.x, last.pose.position.y);
-    }
-    
     if (velocity_path.points.size() >= 2) {
         const auto& first_vel = velocity_path.points.front();
         const auto& last_vel = velocity_path.points.back();
@@ -722,7 +727,7 @@ void LatticePlanner::publish_selected_path(const PathCandidate& path) {
             last_vel.x, last_vel.y, last_vel.velocity);
     }
     
-    RCLCPP_ERROR(this->get_logger(), "[PUBLISH SUCCESS] Both topics published successfully!");
+    RCLCPP_ERROR(this->get_logger(), "[PUBLISH SUCCESS] PathWithVelocity published successfully!");
 }
 
 void LatticePlanner::publish_path_visualization(
@@ -761,27 +766,6 @@ void LatticePlanner::ref_path_timer_callback() {
 }
 
 
-nav_msgs::msg::Path LatticePlanner::convert_to_nav_path(const PathCandidate& path) {
-    nav_msgs::msg::Path nav_path;
-    nav_path.header.frame_id = "map";
-    nav_path.header.stamp = this->get_clock()->now();
-    
-    for (const auto& point : path.points) {
-        geometry_msgs::msg::PoseStamped pose;
-        pose.header = nav_path.header;
-        pose.pose.position.x = point.x;
-        pose.pose.position.y = point.y;
-        pose.pose.position.z = 0.0;
-        
-        tf2::Quaternion q;
-        q.setRPY(0, 0, point.yaw);
-        tf2::convert(q, pose.pose.orientation);
-        
-        nav_path.poses.push_back(pose);
-    }
-    
-    return nav_path;
-}
 
 planning_custom_msgs::msg::PathWithVelocity LatticePlanner::convert_to_path_with_velocity(const PathCandidate& path) {
     planning_custom_msgs::msg::PathWithVelocity velocity_path;
@@ -877,6 +861,19 @@ visualization_msgs::msg::MarkerArray LatticePlanner::create_path_markers(
         }
         const bool is_safe_now = (!collided && !out_of_track);
 
+        // If this candidate goes out of track, don't visualize it at all.
+        // Also publish a DELETE to remove any leftover marker with the same id from previous frames.
+        if (out_of_track) {
+            visualization_msgs::msg::Marker del;
+            del.header.frame_id = "map";
+            del.header.stamp = now;
+            del.ns = "path_candidates";
+            del.id = static_cast<int>(i);
+            del.action = visualization_msgs::msg::Marker::DELETE;
+            markers.markers.push_back(del);
+            continue; // skip rendering this candidate
+        }
+
         visualization_msgs::msg::Marker marker;
         marker.header.frame_id = "map";
         marker.header.stamp = now;
@@ -887,18 +884,18 @@ visualization_msgs::msg::MarkerArray LatticePlanner::create_path_markers(
         
         marker.scale.x = 0.05;  // Line width
         
-        // Color coding based on real-time checks: green=safe, red=collided/track-out
+        // Color coding based on real-time checks: green=safe, red=collided
         if (is_safe_now) {
             marker.color.r = 0.0;
             marker.color.g = 1.0;
             marker.color.b = 0.0;
             marker.color.a = 0.7;
         } else {
-            // Red for unsafe (collision or out-of-track)
+            // Red for unsafe (collision). Out-of-track paths are not visualized above.
             marker.color.r = 1.0;
             marker.color.g = 0.0;
             marker.color.b = 0.0;
-            marker.color.a = out_of_track ? 0.25 : 0.6; // lighter if out-of-track only
+            marker.color.a = 0.6;
         }
         
         marker.points = std::move(geom_pts);

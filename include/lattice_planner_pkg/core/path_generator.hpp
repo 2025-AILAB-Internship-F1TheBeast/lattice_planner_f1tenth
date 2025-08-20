@@ -2,6 +2,7 @@
 
 #include "lattice_planner_pkg/core/types.hpp"
 #include "lattice_planner_pkg/core/frenet_coordinate.hpp"
+#include "obstacle_detection_pkg/msg/obstacle.hpp"
 #include <vector>
 #include <memory>
 
@@ -21,6 +22,14 @@ public:
         double vehicle_yaw,
         double vehicle_velocity,
         const std::vector<Obstacle>& obstacles
+    );
+    
+    // Generate lattice paths using global obstacles
+    std::vector<PathCandidate> generate_paths_with_global_obstacles(
+        const Point2D& vehicle_position,
+        double vehicle_yaw,
+        double vehicle_velocity,
+        const std::vector<obstacle_detection_pkg::msg::Obstacle>& global_obstacles
     );
     
     // Generate single path with specific lateral offset
@@ -59,17 +68,29 @@ private:
         const std::vector<Obstacle>& obstacles
     );
     
+    // Check path collision with global obstacles (from obstacle_detection_pkg)
+    bool check_collision_with_global_obstacles(
+        const PathCandidate& path,
+        const std::vector<obstacle_detection_pkg::msg::Obstacle>& global_obstacles
+    );
+    
     // Check if lateral offset is within track bounds at given s position
     bool is_within_track_bounds(double lateral_offset, double s_position) const;
     
     // Generate time samples
     std::vector<double> generate_time_samples() const;
     
+    // Generate time samples with dynamic horizon based on velocity
+    std::vector<double> generate_time_samples_dynamic(double vehicle_velocity) const;
+    
     // Generate lateral offset samples relative to current position
     std::vector<double> generate_lateral_samples(double current_d) const;
     
     // Generate velocity samples
     std::vector<double> generate_velocity_samples(double current_velocity, double current_s) const;
+    
+    // Calculate dynamic planning horizon based on speed
+    double calculate_dynamic_horizon(double vehicle_velocity) const;
 };
 
 } // namespace lattice_planner_pkg
